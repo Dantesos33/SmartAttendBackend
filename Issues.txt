@@ -1,0 +1,28 @@
+1. Role Student is not permitted to perform this action in student dashboard.
+2. Settings Tab should not be shown to teacher --Fixed
+3. Real Time updates should permanently delete when cross icon is clicked.
+4. Alerts can actually be clicked and redirect to that particular screen. --Fixed
+5. No Data Export, Privacy Policy Screen yet.  --Fixed
+6. No Functionality for Autosave Photos and Push Notifications in settings is created.
+7. Profile Image change is not working.
+8. Classes intent functionality is not working as intended it sometimes redirects to another screen instead of the intended screen. --Fixed
+9. No Quick Action for Enrollment Requests and Leave Requests. --Fixed
+10. View Report screen is still not dynamic. --Fixed
+11. There is no way to add bulk of students. --Fixed
+12. There is no way to migrate the database.
+13. When i click on the back icon it redirects to home screen instead of the previous screen.
+14. Leave Requests Quick Action should redirect to the Enrollment Requests screen.
+15. No Custom Errors are shown when something goes wrong or login fails etc.
+16. No Custom Success are shown.
+17. No Animations are used for the UI.
+18. No Loading Screen is shown when something is loading.
+19. Profile Photo should be used as the avatar when it is uploaded else show what is already being shown.
+20. Change Profile Photo dialog ui must be improved.
+21. Real-time updates card pushes the cross icon when text is large.
+22. Overall Attendance card in student's dashboard should be improved.
+23. View Calender button is not working. (Teacher)
+24. Add new Student Redirect to Homepage.
+25. Teacher can select the same time for multiple universities classes.
+26. In create class the time format should be in 12 hour format and easy to use by the user.
+27. Forget Password Functionality is not working.
+28. Signing in with wrong credentials redirects to same page without giving any custom error.
