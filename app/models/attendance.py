@@ -1,4 +1,5 @@
 import enum
+import datetime # Added to generate safe date/time stamps natively via Python
 
 from sqlalchemy import Column, Integer, Enum, Date, Time, DateTime, ForeignKey, func
 from sqlalchemy.orm import relationship
@@ -22,11 +23,16 @@ class AttendanceSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     section_id = Column(Integer, ForeignKey("sections.id"), nullable=False)
     taken_by = Column(Integer, ForeignKey("users.id"), nullable=False)  # teacher
-    date = Column(Date, server_default=func.current_date())
-    time = Column(Time, server_default=func.current_time())
+    
+    # CHANGED: Swapped server_default for safe Python-level default execution blocks
+    date = Column(Date, default=datetime.date.today, nullable=False)
+    time = Column(Time, default=lambda: datetime.datetime.now().time(), nullable=False)
+    
     present_count = Column(Integer, default=0)
     absent_count = Column(Integer, default=0)
     leave_count = Column(Integer, default=0)
+    
+    # DateTime functions work perfectly fine as server_defaults in all MySQL versions
     created_at = Column(DateTime, server_default=func.now())
 
     section = relationship("Section", back_populates="attendance_sessions")
