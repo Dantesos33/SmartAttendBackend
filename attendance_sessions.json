@@ -1,0 +1,1331 @@
+[
+    {
+        "date": "2026-03-09",
+        "time": "06:55:25",
+        "total_students": 1,
+        "present": [
+            "Noman"
+        ],
+        "absent": [],
+        "present_count": 1,
+        "absent_count": 0,
+        "unknown_faces": 2,
+        "face_details": [
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    254,
+                    552,
+                    329,
+                    478
+                ]
+            },
+            {
+                "name": "Noman",
+                "confidence": 0.5888203602418084,
+                "location": [
+                    294,
+                    273,
+                    357,
+                    211
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    211,
+                    729,
+                    274,
+                    667
+                ]
+            }
+        ],
+        "annotated_image_path": "output/annotated_classroom_202603d_065525.jpg"
+    },
+    {
+        "date": "2026-06-15",
+        "time": "12:38:31",
+        "total_students": 5,
+        "present": [
+            "Absar",
+            "Ahmed",
+            "Mirza",
+            "Noman"
+        ],
+        "absent": [
+            "Muhaddis"
+        ],
+        "present_count": 4,
+        "absent_count": 1,
+        "unknown_faces": 41,
+        "face_details": [
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    751,
+                    833,
+                    813,
+                    771
+                ]
+            },
+            {
+                "name": "Absar",
+                "confidence": 0.5669080390804959,
+                "location": [
+                    716,
+                    1545,
+                    778,
+                    1483
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    764,
+                    1702,
+                    815,
+                    1650
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    840,
+                    1828,
+                    903,
+                    1766
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    752,
+                    121,
+                    826,
+                    46
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    875,
+                    1524,
+                    937,
+                    1462
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    751,
+                    1863,
+                    813,
+                    1801
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    758,
+                    2146,
+                    820,
+                    2084
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    764,
+                    1434,
+                    827,
+                    1372
+                ]
+            },
+            {
+                "name": "Mirza",
+                "confidence": 0.5106819732339296,
+                "location": [
+                    751,
+                    2305,
+                    813,
+                    2243
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    620,
+                    953,
+                    671,
+                    901
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    633,
+                    805,
+                    695,
+                    743
+                ]
+            },
+            {
+                "name": "Noman",
+                "confidence": 0.5079930621258959,
+                "location": [
+                    631,
+                    1869,
+                    683,
+                    1817
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    591,
+                    677,
+                    643,
+                    625
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    599,
+                    577,
+                    661,
+                    515
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    633,
+                    1607,
+                    695,
+                    1545
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    585,
+                    1339,
+                    637,
+                    1287
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    562,
+                    1253,
+                    614,
+                    1201
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    614,
+                    1414,
+                    666,
+                    1362
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    637,
+                    1806,
+                    689,
+                    1754
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    605,
+                    861,
+                    668,
+                    798
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    737,
+                    315,
+                    799,
+                    252
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    619,
+                    1068,
+                    681,
+                    1006
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    688,
+                    577,
+                    751,
+                    515
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    585,
+                    1126,
+                    637,
+                    1074
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    614,
+                    1483,
+                    666,
+                    1431
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    771,
+                    1137,
+                    834,
+                    1075
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    573,
+                    999,
+                    625,
+                    947
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    626,
+                    1199,
+                    688,
+                    1137
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    596,
+                    1921,
+                    648,
+                    1869
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    694,
+                    1955,
+                    746,
+                    1903
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    751,
+                    681,
+                    813,
+                    619
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    771,
+                    494,
+                    834,
+                    432
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    785,
+                    951,
+                    847,
+                    888
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    631,
+                    1247,
+                    683,
+                    1195
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    764,
+                    2029,
+                    827,
+                    1967
+                ]
+            },
+            {
+                "name": "Ahmed",
+                "confidence": 0.5570236566720428,
+                "location": [
+                    585,
+                    1732,
+                    647,
+                    1669
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    716,
+                    1289,
+                    778,
+                    1227
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    605,
+                    2160,
+                    668,
+                    2098
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    660,
+                    419,
+                    735,
+                    345
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    605,
+                    460,
+                    668,
+                    398
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    614,
+                    1541,
+                    666,
+                    1489
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    677,
+                    2076,
+                    729,
+                    2024
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    562,
+                    740,
+                    614,
+                    688
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    617,
+                    1658,
+                    660,
+                    1615
+                ]
+            }
+        ],
+        "annotated_image_path": "output/annotated_classroom_202606d_123831.jpg"
+    },
+    {
+        "date": "2026-06-15",
+        "time": "12:43:09",
+        "total_students": 5,
+        "present": [
+            "Mirza",
+            "Muhaddis",
+            "Noman"
+        ],
+        "absent": [
+            "Absar",
+            "Ahmed"
+        ],
+        "present_count": 3,
+        "absent_count": 2,
+        "unknown_faces": 29,
+        "face_details": [
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    410,
+                    753,
+                    446,
+                    717
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    410,
+                    461,
+                    446,
+                    425
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    396,
+                    213,
+                    439,
+                    170
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    414,
+                    521,
+                    450,
+                    485
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    684,
+                    525,
+                    727,
+                    482
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    377,
+                    1034,
+                    420,
+                    991
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    402,
+                    701,
+                    438,
+                    665
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    458,
+                    409,
+                    494,
+                    373
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    643,
+                    919,
+                    694,
+                    867
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    444,
+                    304,
+                    487,
+                    261
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    706,
+                    366,
+                    758,
+                    314
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    391,
+                    1092,
+                    434,
+                    1048
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    516,
+                    463,
+                    568,
+                    412
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    689,
+                    660,
+                    732,
+                    616
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    370,
+                    429,
+                    406,
+                    393
+                ]
+            },
+            {
+                "name": "Noman",
+                "confidence": 0.5300036683932359,
+                "location": [
+                    406,
+                    386,
+                    449,
+                    343
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    626,
+                    777,
+                    662,
+                    741
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    414,
+                    653,
+                    450,
+                    617
+                ]
+            },
+            {
+                "name": "Muhaddis",
+                "confidence": 0.5644506529185249,
+                "location": [
+                    535,
+                    568,
+                    578,
+                    525
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    370,
+                    641,
+                    406,
+                    605
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    398,
+                    581,
+                    434,
+                    545
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    374,
+                    993,
+                    410,
+                    957
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    386,
+                    1207,
+                    430,
+                    1164
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    401,
+                    957,
+                    444,
+                    914
+                ]
+            },
+            {
+                "name": "Mirza",
+                "confidence": 0.5786558181468033,
+                "location": [
+                    358,
+                    597,
+                    394,
+                    561
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    402,
+                    329,
+                    438,
+                    293
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    401,
+                    1178,
+                    444,
+                    1135
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    395,
+                    907,
+                    447,
+                    855
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    418,
+                    141,
+                    470,
+                    89
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    402,
+                    805,
+                    438,
+                    769
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    377,
+                    1135,
+                    420,
+                    1092
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    366,
+                    865,
+                    402,
+                    829
+                ]
+            }
+        ],
+        "annotated_image_path": "output/annotated_classroom_202606d_124309.jpg"
+    },
+    {
+        "date": "2026-06-15",
+        "time": "12:57:33",
+        "total_students": 9,
+        "present": [
+            "Absar",
+            "Ahmed",
+            "Mirza",
+            "Najaf",
+            "Noman",
+            "Shayan",
+            "Talha Iqbal"
+        ],
+        "absent": [
+            "Aliyan ",
+            "Muhaddis"
+        ],
+        "present_count": 7,
+        "absent_count": 2,
+        "unknown_faces": 38,
+        "face_details": [
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    751,
+                    923,
+                    813,
+                    861
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    840,
+                    1918,
+                    903,
+                    1856
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    764,
+                    1788,
+                    815,
+                    1736
+                ]
+            },
+            {
+                "name": "Absar",
+                "confidence": 0.5764479540053948,
+                "location": [
+                    716,
+                    1635,
+                    778,
+                    1573
+                ]
+            },
+            {
+                "name": "Noman",
+                "confidence": 0.5019601582380355,
+                "location": [
+                    631,
+                    1955,
+                    683,
+                    1903
+                ]
+            },
+            {
+                "name": "Mirza",
+                "confidence": 0.5036140464425379,
+                "location": [
+                    751,
+                    2395,
+                    813,
+                    2333
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    637,
+                    1892,
+                    689,
+                    1840
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    591,
+                    763,
+                    643,
+                    711
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    620,
+                    1039,
+                    671,
+                    988
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    585,
+                    1425,
+                    637,
+                    1374
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    751,
+                    1953,
+                    813,
+                    1891
+                ]
+            },
+            {
+                "name": "Shayan",
+                "confidence": 0.5422354821482249,
+                "location": [
+                    752,
+                    204,
+                    826,
+                    129
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    758,
+                    2226,
+                    810,
+                    2174
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    605,
+                    951,
+                    668,
+                    888
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    875,
+                    1607,
+                    937,
+                    1545
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    764,
+                    1524,
+                    827,
+                    1462
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    614,
+                    1500,
+                    666,
+                    1448
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    633,
+                    1697,
+                    695,
+                    1635
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    599,
+                    667,
+                    661,
+                    605
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    562,
+                    1339,
+                    614,
+                    1287
+                ]
+            },
+            {
+                "name": "Ahmed",
+                "confidence": 0.5725975227960747,
+                "location": [
+                    585,
+                    1815,
+                    647,
+                    1752
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    585,
+                    1212,
+                    637,
+                    1160
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    614,
+                    1569,
+                    666,
+                    1518
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    637,
+                    884,
+                    689,
+                    832
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    771,
+                    577,
+                    834,
+                    515
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    764,
+                    2112,
+                    827,
+                    2050
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    694,
+                    2042,
+                    746,
+                    1990
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    785,
+                    1040,
+                    847,
+                    978
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    592,
+                    2015,
+                    654,
+                    1953
+                ]
+            },
+            {
+                "name": "Najaf",
+                "confidence": 0.5443561634050765,
+                "location": [
+                    737,
+                    405,
+                    799,
+                    342
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    573,
+                    1086,
+                    625,
+                    1034
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    751,
+                    771,
+                    813,
+                    709
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    688,
+                    667,
+                    751,
+                    605
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    619,
+                    1151,
+                    681,
+                    1089
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    661,
+                    501,
+                    723,
+                    439
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    716,
+                    1372,
+                    778,
+                    1310
+                ]
+            },
+            {
+                "name": "Talha Iqbal",
+                "confidence": 0.5235860145806248,
+                "location": [
+                    764,
+                    1220,
+                    827,
+                    1158
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    631,
+                    1333,
+                    683,
+                    1281
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    626,
+                    1289,
+                    688,
+                    1227
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    614,
+                    544,
+                    666,
+                    492
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    679,
+                    2162,
+                    722,
+                    2119
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    608,
+                    2243,
+                    660,
+                    2191
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    614,
+                    1627,
+                    666,
+                    1575
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    562,
+                    826,
+                    614,
+                    775
+                ]
+            },
+            {
+                "name": "Unknown",
+                "confidence": 0.0,
+                "location": [
+                    614,
+                    1748,
+                    666,
+                    1696
+                ]
+            }
+        ],
+        "annotated_image_path": "output/annotated_classroom_202606d_125733.jpg"
+    }
+]

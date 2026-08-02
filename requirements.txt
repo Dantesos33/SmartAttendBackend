@@ -1,0 +1,19 @@
+fastapi
+uvicorn[standard]
+sqlalchemy>=2.0
+pymysql
+cryptography
+alembic
+pydantic[email]
+pydantic-settings
+python-jose[cryptography]
+bcrypt
+python-multipart
+python-dotenv
+
+# Recognition engine dependencies
+face_recognition
+opencv-python-headless
+pillow
+numpy
+pandas
