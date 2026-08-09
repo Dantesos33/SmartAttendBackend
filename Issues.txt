@@ -1,28 +1,72 @@
-1. Role Student is not permitted to perform this action in student dashboard.
-2. Settings Tab should not be shown to teacher --Fixed
-3. Real Time updates should permanently delete when cross icon is clicked.
-4. Alerts can actually be clicked and redirect to that particular screen. --Fixed
-5. No Data Export, Privacy Policy Screen yet.  --Fixed
-6. No Functionality for Autosave Photos and Push Notifications in settings is created.
-7. Profile Image change is not working.
-8. Classes intent functionality is not working as intended it sometimes redirects to another screen instead of the intended screen. --Fixed
-9. No Quick Action for Enrollment Requests and Leave Requests. --Fixed
-10. View Report screen is still not dynamic. --Fixed
-11. There is no way to add bulk of students. --Fixed
-12. There is no way to migrate the database.
-13. When i click on the back icon it redirects to home screen instead of the previous screen.
-14. Leave Requests Quick Action should redirect to the Enrollment Requests screen.
-15. No Custom Errors are shown when something goes wrong or login fails etc.
-16. No Custom Success are shown.
-17. No Animations are used for the UI.
-18. No Loading Screen is shown when something is loading.
-19. Profile Photo should be used as the avatar when it is uploaded else show what is already being shown.
-20. Change Profile Photo dialog ui must be improved.
-21. Real-time updates card pushes the cross icon when text is large.
-22. Overall Attendance card in student's dashboard should be improved.
-23. View Calender button is not working. (Teacher)
-24. Add new Student Redirect to Homepage.
-25. Teacher can select the same time for multiple universities classes.
-26. In create class the time format should be in 12 hour format and easy to use by the user.
-27. Forget Password Functionality is not working.
-28. Signing in with wrong credentials redirects to same page without giving any custom error.
+# SmartAttend Issue Register
+# Last reviewed: 2026-08-09
+# Priority: CRITICAL > HIGH > MEDIUM > LOW
+# Status: [FIXED] = verified in code, [PARTIAL] = partly addressed, [OPEN] = remaining work
+
+## CRITICAL
+
+1. [FIXED] Student role was rejected by student dashboard actions.
+2. [FIXED] Profile image upload and avatar display were not working consistently.
+3. [OPEN] Forgot-password functionality is missing. A secure reset-token and email-delivery flow is still required.
+4. [FIXED] Wrong login credentials now show a custom error instead of silently returning to the same screen.
+5. [PARTIAL] SQL query optimization is substantially improved. Dashboard attendance, low-attendance warnings, report CSV/history relations, and class serializer relationships now use grouped queries or eager loading; remaining endpoint-level profiling and load testing are still required.
+
+## HIGH
+
+6. [FIXED] Real-time update dismissal permanently deletes the notification after the cross icon is pressed.
+7. [FIXED] Alerts are clickable and route to the relevant screen.
+8. [FIXED] Class intent routing was corrected for attendance and add-student actions.
+9. [FIXED] Enrollment and leave request quick actions were added.
+10. [FIXED] Reports now load dynamic backend data for the selected period.
+11. [FIXED] Bulk student import is available through manual rows and CSV/text import.
+12. [FIXED] Alembic migrations are implemented, exposed from the admin dashboard, and legacy create_all databases can be adopted safely.
+13. [PARTIAL] Back navigation now uses router.back() in shared headers and custom back buttons, but every workflow still needs device-level verification for nested routes.
+14. [FIXED] The teacher Leave Requests quick action now routes to Enrollment Requests as required.
+15. [PARTIAL] The shared themed ErrorModal/FeedbackModal now covers API and processing failures across the main workflows. Remaining native alerts are validation, permission, confirmation, informational, and a few secondary auth/profile/password messages.
+16. [PARTIAL] A shared FeedbackModal now supports success and error states with optional actions and is used by admin, enrollment, reports, attendance, export, processing, profile verification, camera, class, and roster workflows. Secondary auth/profile/password success messages still need migration.
+17. [OPEN] Teacher View Calendar still routes to attendance history rather than a dedicated calendar view.
+18. [FIXED] Class schedule overlap validation prevents a teacher from selecting conflicting times.
+19. [FIXED] Class creation accepts 12-hour input and converts it to the backend time format.
+20. [FIXED] Class editing and deletion are available with ownership checks.
+
+## MEDIUM
+
+21. [PARTIAL] Settings persist Auto-save Photos and Push Notifications toggles locally, but push notifications are not connected to a device notification service.
+22. [PARTIAL] Animations exist on splash, class modal, and selected interactions, but the UI does not yet have consistent screen and state animations.
+23. [PARTIAL] Loading indicators exist on many screens, but there is no shared loading-state component or global loading treatment.
+24. [FIXED] Uploaded profile photos are used as avatars, with initials as the fallback.
+25. [OPEN] Change Profile Photo still uses a native source-selection alert; the photo-picker dialog UI needs a custom cross-platform modal.
+26. [OPEN] Long real-time update text can still compete with the dismiss icon; the alert layout needs a final constrained-row treatment and device testing.
+27. [OPEN] Student Overall Attendance card needs a clearer breakdown of present, absent, leave, and enrolled-course totals.
+28. [FIXED] Add Student action now follows the intended class/add-student flow instead of unexpectedly returning home.
+29. [FIXED] App icon, splash logo, favicon, login logo, registration logo, and startup logo use the shared SmartAttend branding.
+30. [OPEN] Bottom navigation still needs Android and iOS device verification around the floating center button and safe-area spacing.
+31. [FIXED] Register screen has a back button.
+32. [FIXED] Admin can add a university using a cross-platform modal.
+33. [FIXED] Admin recent logs now use live notification activity instead of placeholder text.
+
+## LOW
+
+34. [FIXED] Data Export and Privacy Policy screens are available.
+35. [FIXED] Settings is hidden from teacher tab navigation as required.
+36. [FIXED] Keyboard-aware containers and keyboardShouldPersistTaps were added to the remaining input-heavy forms and modals.
+37. [FIXED] Custom APK/web favicon and native icon configuration were added.
+38. [FIXED] Existing class CRUD, bulk enrollment, migration, notification deletion, and profile avatar fallbacks were retained through the regression pass.
+
+## Remaining Work Summary
+
+- CRITICAL: secure forgot-password flow; production query profiling/load testing and final relationship review.
+- HIGH: dedicated teacher calendar; finish migrating secondary native API/success alerts and validation feedback.
+- MEDIUM: push notification service; global animation/loading patterns; custom photo picker; student attendance card; long-alert layout; bottom navigation device testing.
+
+## Production Readiness
+
+- [FIXED] Alembic is the authoritative migration path; Docker applies `python migrate_db.py` before starting Uvicorn.
+- [FIXED] Production configuration rejects weak JWT secrets and wildcard CORS.
+- [FIXED] `/health` and `/ready` endpoints are available for liveness and database readiness checks.
+- [FIXED] Expo production API URL is configurable through `extra.apiBaseUrl` instead of being code-only.
+- [VERIFIED] Backend/Alembic compilation, offline MySQL migration SQL generation, frontend TypeScript validation, and secure configuration checks pass.
+- [BLOCKED] Docker image build still requires Docker Desktop's Linux engine to be running locally.
+- [BLOCKED] Railway currently serves an older revision: `/` responds, but the new `/health` and `/ready` endpoints return 404. Redeploy the current backend before production sign-off.
+- [URGENT] Rotate the Aiven database password and replace the production JWT secret in Railway. They were present in the local production env file and must be treated as exposed.
+- [REQUIRES DEPLOYMENT] After redeploying, verify `/health`, `/ready`, Alembic upgrade, persistent media storage, SMTP password recovery, and Android/iOS device behavior in the target production environment.

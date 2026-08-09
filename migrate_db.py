@@ -1,22 +1,41 @@
 import os
 import sys
-from sqlalchemy import inspect, text
+from pathlib import Path
+
+# The local migration script directory is named ``alembic``. Remove the
+# backend path while importing the third-party package so it is not shadowed
+# by that local namespace package when this file is run directly.
+backend_dir = os.path.abspath(os.path.dirname(__file__))
+parent_dir = os.path.dirname(backend_dir)
+os.chdir(parent_dir)
+sys.path = [entry for entry in sys.path if entry not in ("", backend_dir)]
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import inspect
 
 # Add backend directory to sys.path
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+sys.path.insert(0, backend_dir)
+os.chdir(backend_dir)
 
-from app.database import engine, Base
-from app import models  # Ensure all SQLAlchemy models are loaded
 from app.models.user import User, UserRole
+from app.database import engine
 from app.core.security import hash_password
 from app.database import SessionLocal
 
 def run_migrations():
     print("Starting SmartAttend database migration...")
-    
-    # 1. Ensure all tables defined in models exist in the database
-    Base.metadata.create_all(bind=engine)
-    print("✓ Created/verified all database tables.")
+
+    alembic_config = Config(str(Path(__file__).with_name("alembic.ini")))
+    inspector = inspect(engine)
+    if inspector.has_table("users") and not inspector.has_table("alembic_version"):
+        # Adopt databases created by the former create_all-based bootstrap.
+        # They already contain the baseline schema, so stamping avoids trying
+        # to recreate existing tables; all future revisions still run normally.
+        command.stamp(alembic_config, "head")
+        print("✓ Existing schema adopted as Alembic baseline.")
+    else:
+        command.upgrade(alembic_config, "head")
+        print("✓ Alembic migrations applied.")
 
     # 2. Check and seed initial admin user if no admin exists
     db = SessionLocal()

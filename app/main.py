@@ -2,8 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
+from sqlalchemy import text
 
-from app.database import Base, engine
 from app import models  # noqa: F401 — ensures all models are registered on Base before create_all
 from app.config import settings
 from app.routers import auth, universities, classes, enrollments, notifications, attendance, dashboard, recognition, leave, admin, reports
@@ -15,23 +15,29 @@ origins = ["*"] if settings.CORS_ORIGINS == "*" else [o.strip() for o in setting
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
+    allow_credentials=settings.CORS_ORIGINS != "*",
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.on_event("startup")
-def on_startup():
-    # Quick-start table creation. For real schema changes going forward, switch
-    # to Alembic migrations (already in requirements.txt) instead of relying on
-    # create_all, which won't alter existing tables.
-    Base.metadata.create_all(bind=engine)
-
-
 @app.get("/")
 def read_root():
     return {"message": "SmartAttend main API is running."}
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness_check():
+    from app.database import engine
+
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+    return {"status": "ready"}
 
 
 os.makedirs("known_students", exist_ok=True)

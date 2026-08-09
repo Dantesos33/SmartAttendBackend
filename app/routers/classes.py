@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
+from datetime import time
 
 from app.database import get_db
 from app.models.user import User, UserRole
@@ -36,6 +37,47 @@ def _class_to_out(cls: Class) -> ClassOut:
     )
 
 
+def _validate_schedule(
+    db: Session,
+    teacher_id: int,
+    proposed: list[tuple[str | None, time | None, time | None]],
+    exclude_class_id: int | None = None,
+) -> None:
+    """Reject invalid times and overlapping sections for one teacher."""
+    def days(value: str | None) -> set[str]:
+        return {day.strip().lower() for day in (value or "").split(",") if day.strip()}
+
+    for schedule_days, start, end in proposed:
+        if start is None or end is None:
+            continue
+        if start >= end:
+            raise HTTPException(status_code=400, detail="Class end time must be after start time.")
+
+    query = (
+        db.query(Section)
+        .join(Class, Section.class_id == Class.id)
+        .filter(Class.teacher_id == teacher_id)
+    )
+    if exclude_class_id is not None:
+        query = query.filter(Class.id != exclude_class_id)
+
+    existing = query.all()
+    for proposed_days, proposed_start, proposed_end in proposed:
+        proposed_day_set = days(proposed_days)
+        if proposed_start is None or proposed_end is None:
+            continue
+        for section in existing:
+            if section.start_time is None or section.end_time is None:
+                continue
+            if not proposed_day_set.intersection(days(section.schedule_days)):
+                continue
+            if proposed_start < section.end_time and section.start_time < proposed_end:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This teacher already has a class scheduled during that time.",
+                )
+
+
 @router.post("", response_model=ClassOut, status_code=201)
 def create_class(
     payload: ClassCreate,
@@ -48,6 +90,12 @@ def create_class(
     university = db.query(University).filter(University.id == payload.university_id).first()
     if not university:
         raise HTTPException(status_code=404, detail="University not found.")
+
+    _validate_schedule(
+        db,
+        current_user.id,
+        [(s.schedule_days, s.start_time, s.end_time) for s in payload.sections],
+    )
 
     existing_code = db.query(Class).filter(Class.code == payload.code).first()
     if existing_code:
@@ -94,7 +142,10 @@ def my_enrolled_classes(
         return []
     classes = (
         db.query(Class)
-        .options(joinedload(Class.sections), joinedload(Class.university))
+        .options(
+            joinedload(Class.university),
+            joinedload(Class.sections).selectinload(Section.enrollments),
+        )
         .filter(Class.id.in_(class_ids))
         .all()
     )
@@ -110,7 +161,10 @@ def my_classes(
     just university membership."""
     classes = (
         db.query(Class)
-        .options(joinedload(Class.sections), joinedload(Class.university))
+        .options(
+            joinedload(Class.university),
+            joinedload(Class.sections).selectinload(Section.enrollments),
+        )
         .filter(Class.teacher_id == current_user.id)
         .all()
     )
@@ -128,7 +182,9 @@ def browse_classes(
     pending request for that class — so the frontend can grey out / relabel the
     request button instead of allowing a second request for the same class."""
     query = db.query(Class).options(
-        joinedload(Class.sections), joinedload(Class.university), joinedload(Class.teacher)
+        joinedload(Class.university),
+        joinedload(Class.teacher),
+        joinedload(Class.sections).selectinload(Section.enrollments),
     )
     if university_id:
         query = query.filter(Class.university_id == university_id)
@@ -186,7 +242,10 @@ def all_classes(
 ):
     """Admin oversight view — every class across every teacher and university,
     optionally filtered to one university."""
-    query = db.query(Class).options(joinedload(Class.sections), joinedload(Class.university))
+    query = db.query(Class).options(
+        joinedload(Class.university),
+        joinedload(Class.sections).selectinload(Section.enrollments),
+    )
     if university_id:
         query = query.filter(Class.university_id == university_id)
     return [_class_to_out(c) for c in query.all()]
@@ -312,6 +371,13 @@ def update_class(
             section.start_time = section_update.start_time
         if section_update.end_time is not None:
             section.end_time = section_update.end_time
+
+    _validate_schedule(
+        db,
+        cls.teacher_id,
+        [(s.schedule_days, s.start_time, s.end_time) for s in cls.sections],
+        exclude_class_id=cls.id,
+    )
 
     db.commit()
     db.refresh(cls)

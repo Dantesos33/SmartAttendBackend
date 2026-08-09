@@ -3,7 +3,8 @@ from datetime import date, timedelta
 from collections import defaultdict
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func
 
 from app.database import get_db
 from app.models.user import User, UserRole
@@ -62,6 +63,7 @@ def get_report_summary(
     sessions = (
         db.query(AttendanceSession)
         .join(Section, AttendanceSession.section_id == Section.id)
+        .options(joinedload(AttendanceSession.section).joinedload(Section.class_))
         .filter(
             Section.class_id.in_(class_ids),
             AttendanceSession.date >= start_date,
@@ -119,9 +121,16 @@ def get_report_summary(
             })
 
     # ---------- by_class ----------
+    classes = db.query(Class).filter(Class.id.in_(class_ids)).all()
+    enrollment_counts = dict(
+        db.query(Enrollment.class_id, func.count(Enrollment.id))
+        .filter(Enrollment.class_id.in_(class_ids))
+        .group_by(Enrollment.class_id)
+        .all()
+    )
     class_data: dict[int, dict] = {}
-    for cls_id in class_ids:
-        cls = db.query(Class).filter(Class.id == cls_id).first()
+    for cls in classes:
+        cls_id = cls.id
         if not cls:
             continue
         cls_sessions = [s for s in sessions if s.section.class_id == cls_id]
@@ -133,7 +142,7 @@ def get_report_summary(
             "class_code": cls.code,
             "attendance_pct": round((total_p / total_t) * 100, 1) if total_t else None,
             "total_sessions": len(cls_sessions),
-            "total_students": db.query(Enrollment).filter(Enrollment.class_id == cls_id).count(),
+            "total_students": enrollment_counts.get(cls_id, 0),
         }
 
     by_class = sorted(class_data.values(), key=lambda x: (x["attendance_pct"] or 0), reverse=True)
@@ -177,6 +186,12 @@ def export_attendance_csv(
         db.query(AttendanceRecord)
         .join(AttendanceSession, AttendanceRecord.session_id == AttendanceSession.id)
         .join(Section, AttendanceSession.section_id == Section.id)
+        .options(
+            joinedload(AttendanceRecord.student),
+            joinedload(AttendanceRecord.session)
+            .joinedload(AttendanceSession.section)
+            .joinedload(Section.class_),
+        )
         .filter(
             Section.class_id.in_(class_ids),
             AttendanceSession.date >= start_date,

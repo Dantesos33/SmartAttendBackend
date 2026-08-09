@@ -26,4 +26,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Start FastAPI on Railway's dynamic port configuration
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+ENV PYTHONUNBUFFERED=1
+
+# Apply schema changes before serving traffic. Existing create_all-based
+# databases are adopted by migrate_db.py without recreating their tables.
+CMD ["sh", "-c", "python migrate_db.py && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

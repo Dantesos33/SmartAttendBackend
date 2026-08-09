@@ -2,6 +2,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import case, func
 
 from app.database import get_db
 from app.models.user import User, UserRole
@@ -43,6 +44,32 @@ def _class_attendance_percentage(db: Session, student_id: int, class_id: int, ex
         return None
     present = sum(1 for r in records if r.status == AttendanceStatus.present)
     return (present / len(records)) * 100
+
+
+def _attendance_totals_by_student(
+    db: Session,
+    student_ids: list[int],
+    class_id: int,
+    exclude_session_id: int | None = None,
+) -> dict[int, tuple[int, int]]:
+    query = (
+        db.query(
+            AttendanceRecord.student_id,
+            func.sum(case((AttendanceRecord.status == AttendanceStatus.present, 1), else_=0)).label("present_count"),
+            func.count(AttendanceRecord.id).label("record_count"),
+        )
+        .join(AttendanceSession, AttendanceRecord.session_id == AttendanceSession.id)
+        .join(Section, AttendanceSession.section_id == Section.id)
+        .filter(
+            AttendanceRecord.student_id.in_(student_ids),
+            Section.class_id == class_id,
+            AttendanceRecord.status != AttendanceStatus.leave,
+        )
+        .group_by(AttendanceRecord.student_id)
+    )
+    if exclude_session_id is not None:
+        query = query.filter(AttendanceRecord.session_id != exclude_session_id)
+    return {row.student_id: (row.present_count, row.record_count) for row in query.all()}
 
 
 @router.post("/sessions", response_model=AttendanceSessionOut, status_code=201)
@@ -94,13 +121,18 @@ def save_attendance_session(
     # Proactive low-attendance warning: only fire the moment a student's running
     # percentage CROSSES below the threshold, not on every session while they
     # stay chronically low — otherwise they'd get spammed every single class.
-    for r in payload.records:
-        before = _class_attendance_percentage(db, r.student_id, section.class_id, exclude_session_id=session_row.id)
-        after = _class_attendance_percentage(db, r.student_id, section.class_id)
+    student_ids = list({record.student_id for record in payload.records})
+    before_totals = _attendance_totals_by_student(db, student_ids, section.class_id, session_row.id)
+    after_totals = _attendance_totals_by_student(db, student_ids, section.class_id)
+    for student_id in student_ids:
+        before_present, before_count = before_totals.get(student_id, (0, 0))
+        after_present, after_count = after_totals.get(student_id, (0, 0))
+        before = (before_present / before_count) * 100 if before_count else None
+        after = (after_present / after_count) * 100 if after_count else None
         if before is not None and before >= LOW_ATTENDANCE_THRESHOLD and after is not None and after < LOW_ATTENDANCE_THRESHOLD:
             notify(
                 db,
-                user_id=r.student_id,
+                user_id=student_id,
                 type_=NotificationType.low_attendance_warning,
                 title=f"Your attendance in {section.class_.name} has dropped below {int(LOW_ATTENDANCE_THRESHOLD)}%",
                 body=f"Current attendance: {after:.1f}%. Please check with your teacher if this seems wrong.",
@@ -124,22 +156,57 @@ def low_attendance_students(
     under the threshold, optionally narrowed to one university or class."""
     from app.models.class_ import Class as ClassModel
 
-    query = db.query(Enrollment).join(ClassModel, Enrollment.class_id == ClassModel.id)
+    attendance_totals = (
+        db.query(
+            AttendanceRecord.student_id.label("student_id"),
+            Section.class_id.label("class_id"),
+            func.sum(
+                case((AttendanceRecord.status == AttendanceStatus.present, 1), else_=0)
+            ).label("present_count"),
+            func.count(AttendanceRecord.id).label("record_count"),
+        )
+        .join(AttendanceSession, AttendanceRecord.session_id == AttendanceSession.id)
+        .join(Section, AttendanceSession.section_id == Section.id)
+        .filter(AttendanceRecord.status != AttendanceStatus.leave)
+        .group_by(AttendanceRecord.student_id, Section.class_id)
+        .subquery()
+    )
+
+    query = (
+        db.query(
+            Enrollment.student_id,
+            User.name.label("student_name"),
+            Enrollment.class_id,
+            ClassModel.name.label("class_name"),
+            attendance_totals.c.present_count,
+            attendance_totals.c.record_count,
+        )
+        .join(User, Enrollment.student_id == User.id)
+        .join(ClassModel, Enrollment.class_id == ClassModel.id)
+        .outerjoin(
+            attendance_totals,
+            (attendance_totals.c.student_id == Enrollment.student_id)
+            & (attendance_totals.c.class_id == Enrollment.class_id),
+        )
+    )
     if university_id:
         query = query.filter(ClassModel.university_id == university_id)
     if class_id:
         query = query.filter(Enrollment.class_id == class_id)
 
     results = []
-    for enrollment in query.all():
-        pct = _class_attendance_percentage(db, enrollment.student_id, enrollment.class_id)
+    for row in query.all():
+        if row.record_count:
+            pct = (row.present_count / row.record_count) * 100
+        else:
+            pct = None
         if pct is not None and pct < threshold:
             results.append(
                 {
-                    "student_id": enrollment.student_id,
-                    "student_name": enrollment.student.name,
-                    "class_id": enrollment.class_id,
-                    "class_name": enrollment.section.class_.name,
+                    "student_id": row.student_id,
+                    "student_name": row.student_name,
+                    "class_id": row.class_id,
+                    "class_name": row.class_name,
                     "attendance_percentage": round(pct, 1),
                 }
             )
@@ -175,7 +242,11 @@ def student_attendance_history(
         .join(AttendanceSession, AttendanceRecord.session_id == AttendanceSession.id)
         .join(Section, AttendanceSession.section_id == Section.id)
         .join(Class, Section.class_id == Class.id)
-        .options(joinedload(AttendanceRecord.session))
+        .options(
+            joinedload(AttendanceRecord.session)
+            .joinedload(AttendanceSession.section)
+            .joinedload(Section.class_)
+        )
         .filter(AttendanceRecord.student_id == student_id)
         .order_by(AttendanceSession.date.desc(), AttendanceSession.time.desc())
         .all()

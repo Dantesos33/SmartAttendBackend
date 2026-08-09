@@ -2,7 +2,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import case, func
 
 from app.database import get_db
 from app.models.user import User, UserRole
@@ -61,9 +61,34 @@ def dashboard_stats(db: Session = Depends(get_db), current_user: User = Depends(
         }
 
     if current_user.role == UserRole.student:
-        enrollments = db.query(Enrollment).filter(Enrollment.student_id == current_user.id).all()
+        enrolled_class_ids = [
+            row[0]
+            for row in db.query(Enrollment.class_id)
+            .filter(Enrollment.student_id == current_user.id)
+            .all()
+        ]
+        attendance_totals = (
+            db.query(
+                Section.class_id,
+                func.sum(case((AttendanceRecord.status == AttendanceStatus.present, 1), else_=0)).label("present_count"),
+                func.count(AttendanceRecord.id).label("record_count"),
+            )
+            .join(AttendanceSession, AttendanceRecord.session_id == AttendanceSession.id)
+            .join(Section, AttendanceSession.section_id == Section.id)
+            .filter(
+                AttendanceRecord.student_id == current_user.id,
+                AttendanceRecord.status != AttendanceStatus.leave,
+                Section.class_id.in_(enrolled_class_ids),
+            )
+            .group_by(Section.class_id)
+            .all()
+            if enrolled_class_ids
+            else []
+        )
         percentages = [
-            _class_attendance_percentage(db, current_user.id, e.class_id) for e in enrollments
+            (row.present_count / row.record_count) * 100
+            for row in attendance_totals
+            if row.record_count
         ]
         percentages = [p for p in percentages if p is not None]
         overall = round(sum(percentages) / len(percentages), 1) if percentages else None
@@ -77,7 +102,7 @@ def dashboard_stats(db: Session = Depends(get_db), current_user: User = Depends(
         )
         return {
             "role": "student",
-            "enrolled_classes": len(enrollments),
+            "enrolled_classes": len(enrolled_class_ids),
             "overall_attendance_percentage": overall,
             "pending_enrollment_requests": pending_requests,
             "unread_notifications": unread_notifications,
@@ -91,11 +116,30 @@ def dashboard_stats(db: Session = Depends(get_db), current_user: User = Depends(
     present_today = sum(s.present_count for s in today_sessions)
     absent_today = sum(s.absent_count for s in today_sessions)
 
-    low_attendance_count = 0
-    for enrollment in db.query(Enrollment).all():
-        pct = _class_attendance_percentage(db, enrollment.student_id, enrollment.class_id)
-        if pct is not None and pct < LOW_ATTENDANCE_THRESHOLD:
-            low_attendance_count += 1
+    attendance_totals = (
+        db.query(
+            AttendanceRecord.student_id,
+            Section.class_id,
+            func.sum(
+                case(
+                    (AttendanceRecord.status == AttendanceStatus.present, 1),
+                    else_=0,
+                )
+            ).label("present_count"),
+            func.count(AttendanceRecord.id).label("record_count"),
+        )
+        .join(AttendanceSession, AttendanceRecord.session_id == AttendanceSession.id)
+        .join(Section, AttendanceSession.section_id == Section.id)
+        .filter(AttendanceRecord.status != AttendanceStatus.leave)
+        .group_by(AttendanceRecord.student_id, Section.class_id)
+        .all()
+    )
+    low_attendance_count = sum(
+        1
+        for row in attendance_totals
+        if row.record_count
+        and (row.present_count / row.record_count) * 100 < LOW_ATTENDANCE_THRESHOLD
+    )
 
     return {
         "role": "admin",
