@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
@@ -12,38 +12,13 @@ from app.models.attendance import AttendanceSession, AttendanceRecord, Attendanc
 from app.schemas.attendance import AttendanceSessionCreate, AttendanceSessionOut
 from app.core.deps import get_current_user, require_role
 from app.core.notifications import notify
+from app.core.db_helpers import get_section_with_class
 from app.models.notification import NotificationType
 
 router = APIRouter(prefix="/attendance", tags=["attendance"])
 
 
 LOW_ATTENDANCE_THRESHOLD = 75.0
-
-
-def _class_attendance_percentage(db: Session, student_id: int, class_id: int, exclude_session_id: int | None = None) -> float | None:
-    """Present / (present + absent) across every attendance record for this
-    student within this class — "leave" records are excused and excluded
-    from both the numerator and denominator entirely, so an approved leave
-    day neither helps nor hurts the percentage. Optionally excludes one
-    session (used to compute the before-this-session baseline). Returns
-    None if there's no countable history yet."""
-    query = (
-        db.query(AttendanceRecord)
-        .join(AttendanceSession, AttendanceRecord.session_id == AttendanceSession.id)
-        .join(Section, AttendanceSession.section_id == Section.id)
-        .filter(
-            AttendanceRecord.student_id == student_id,
-            Section.class_id == class_id,
-            AttendanceRecord.status != AttendanceStatus.leave,
-        )
-    )
-    if exclude_session_id is not None:
-        query = query.filter(AttendanceRecord.session_id != exclude_session_id)
-    records = query.all()
-    if not records:
-        return None
-    present = sum(1 for r in records if r.status == AttendanceStatus.present)
-    return (present / len(records)) * 100
 
 
 def _attendance_totals_by_student(
@@ -72,20 +47,15 @@ def _attendance_totals_by_student(
     return {row.student_id: (row.present_count, row.record_count) for row in query.all()}
 
 
-@router.post("/sessions", response_model=AttendanceSessionOut, status_code=201)
+@router.post("/sessions", response_model=AttendanceSessionOut)
 def save_attendance_session(
     payload: AttendanceSessionCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher)),
 ):
-    """This is where the manually-reviewed attendance result actually gets
-    committed — the AI recognition service returns raw results first, the
-    teacher reviews/overrides on the frontend, and THIS endpoint is only called
-    once with the final, confirmed list. Every enrolled student not present in
-    `records` at all still needs an explicit status — the frontend is expected
-    to send a row for every enrolled student (present or absent), not just the
-    recognized ones, so nobody is silently left out of the session."""
-    section = db.query(Section).filter(Section.id == payload.section_id).first()
+    """Save or update today's attendance for a section — only one session per
+    section per calendar day. A second save the same day replaces the records."""
+    section = get_section_with_class(db, payload.section_id)
     if not section:
         raise HTTPException(status_code=404, detail="Section not found.")
     if section.class_.teacher_id != current_user.id:
@@ -95,32 +65,51 @@ def save_attendance_session(
     absent_count = sum(1 for r in payload.records if r.status == AttendanceStatus.absent)
     leave_count = sum(1 for r in payload.records if r.status == AttendanceStatus.leave)
 
-    session_row = AttendanceSession(
-        section_id=section.id,
-        taken_by=current_user.id,
-        present_count=present_count,
-        absent_count=absent_count,
-        leave_count=leave_count,
+    today = date.today()
+    existing = (
+        db.query(AttendanceSession)
+        .options(joinedload(AttendanceSession.records))
+        .filter(AttendanceSession.section_id == section.id, AttendanceSession.date == today)
+        .first()
     )
-    db.add(session_row)
-    db.flush()
+
+    old_status_by_student: dict[int, AttendanceStatus] = {}
+    if existing:
+        session_row = existing
+        old_status_by_student = {r.student_id: r.status for r in existing.records}
+        db.query(AttendanceRecord).filter(AttendanceRecord.session_id == session_row.id).delete()
+        session_row.present_count = present_count
+        session_row.absent_count = absent_count
+        session_row.leave_count = leave_count
+        session_row.time = datetime.now().time()
+        session_row.taken_by = current_user.id
+    else:
+        session_row = AttendanceSession(
+            section_id=section.id,
+            taken_by=current_user.id,
+            present_count=present_count,
+            absent_count=absent_count,
+            leave_count=leave_count,
+        )
+        db.add(session_row)
+        db.flush()
 
     for r in payload.records:
         db.add(AttendanceRecord(session_id=session_row.id, student_id=r.student_id, status=r.status))
-        notify(
-            db,
-            user_id=r.student_id,
-            type_=NotificationType.attendance_result,
-            title=f"You were marked {r.status.value.capitalize()} in {section.class_.name}",
-            body=f"Section {section.name} — {session_row.date or date.today()}",
-            related_id=session_row.id,
-        )
+        previous = old_status_by_student.get(r.student_id)
+        if previous != r.status:
+            verb = "updated to" if previous is not None else "marked"
+            notify(
+                db,
+                user_id=r.student_id,
+                type_=NotificationType.attendance_result,
+                title=f"You were {verb} {r.status.value.capitalize()} in {section.class_.name}",
+                body=f"Section {section.name} — {session_row.date or today}",
+                related_id=session_row.id,
+            )
 
-    db.flush()  # so the percentage query below can see the just-added records
+    db.flush()
 
-    # Proactive low-attendance warning: only fire the moment a student's running
-    # percentage CROSSES below the threshold, not on every session while they
-    # stay chronically low — otherwise they'd get spammed every single class.
     student_ids = list({record.student_id for record in payload.records})
     before_totals = _attendance_totals_by_student(db, student_ids, section.class_id, session_row.id)
     after_totals = _attendance_totals_by_student(db, student_ids, section.class_id)
@@ -142,6 +131,51 @@ def save_attendance_session(
     db.commit()
     db.refresh(session_row)
     return session_row
+
+
+@router.get("/sessions/section/{section_id}/today", response_model=AttendanceSessionOut)
+def get_today_session(
+    section_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.teacher)),
+):
+    section = get_section_with_class(db, section_id)
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found.")
+    if section.class_.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You don't own this section's class.")
+
+    session = (
+        db.query(AttendanceSession)
+        .options(joinedload(AttendanceSession.records))
+        .filter(AttendanceSession.section_id == section_id, AttendanceSession.date == date.today())
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="No attendance recorded for this section today.")
+    return session
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+def delete_attendance_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.teacher)),
+):
+    session = (
+        db.query(AttendanceSession)
+        .options(joinedload(AttendanceSession.section).joinedload(Section.class_))
+        .filter(AttendanceSession.id == session_id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Attendance session not found.")
+    if session.section.class_.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You don't own this section's class.")
+
+    db.delete(session)
+    db.commit()
+    return None
 
 
 @router.get("/low-attendance")
@@ -284,7 +318,7 @@ def section_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    section = db.query(Section).filter(Section.id == section_id).first()
+    section = get_section_with_class(db, section_id)
     if not section:
         raise HTTPException(status_code=404, detail="Section not found.")
 
@@ -324,7 +358,9 @@ def request_attendance_taking(
     if not enrolled:
         raise HTTPException(status_code=403, detail="You're not enrolled in this section.")
 
-    section = db.query(Section).filter(Section.id == section_id).first()
+    section = get_section_with_class(db, section_id)
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found.")
 
     already_taken_today = (
         db.query(AttendanceSession)

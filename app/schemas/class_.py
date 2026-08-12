@@ -66,6 +66,7 @@ class ClassOut(BaseModel):
 
 class SectionUpdate(BaseModel):
     id: int
+    name: str | None = None
     schedule_days: str | None = None
     start_time: time | None = None
     end_time: time | None = None
@@ -75,6 +76,7 @@ class ClassUpdate(BaseModel):
     name: str | None = None
     code: str | None = None
     subject: str | None = None
+    university_id: int | None = None
     sections: list[SectionUpdate] | None = None
 
 

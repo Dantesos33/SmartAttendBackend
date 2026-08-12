@@ -12,6 +12,7 @@ from app.models.attendance import AttendanceSession, AttendanceRecord, Attendanc
 from app.schemas.leave import LeaveRequestCreate, LeaveRequestOut
 from app.core.deps import get_current_user, require_role
 from app.core.notifications import notify
+from app.core.db_helpers import get_section_with_class
 from app.models.notification import NotificationType
 
 router = APIRouter(prefix="/leave-requests", tags=["leave-requests"])
@@ -109,7 +110,7 @@ def request_leave(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.student)),
 ):
-    section = db.query(Section).filter(Section.id == payload.section_id).first()
+    section = get_section_with_class(db, payload.section_id)
     if not section:
         raise HTTPException(status_code=404, detail="Section not found.")
 
@@ -164,7 +165,10 @@ def my_leave_requests(
 ):
     requests = (
         db.query(LeaveRequest)
-        .options(joinedload(LeaveRequest.student), joinedload(LeaveRequest.section))
+        .options(
+            joinedload(LeaveRequest.student),
+            joinedload(LeaveRequest.section).joinedload(Section.class_),
+        )
         .filter(LeaveRequest.student_id == current_user.id)
         .order_by(LeaveRequest.requested_at.desc())
         .all()
@@ -180,7 +184,10 @@ def pending_leave_requests(
     requests = (
         db.query(LeaveRequest)
         .join(Section, LeaveRequest.section_id == Section.id)
-        .options(joinedload(LeaveRequest.student), joinedload(LeaveRequest.section))
+        .options(
+            joinedload(LeaveRequest.student),
+            joinedload(LeaveRequest.section).joinedload(Section.class_),
+        )
         .filter(
             Section.class_.has(teacher_id=current_user.id),
             LeaveRequest.status == LeaveRequestStatus.pending,
@@ -191,7 +198,15 @@ def pending_leave_requests(
 
 
 def _get_owned_leave_request(db: Session, request_id: int, teacher: User) -> LeaveRequest:
-    lr = db.query(LeaveRequest).filter(LeaveRequest.id == request_id).first()
+    lr = (
+        db.query(LeaveRequest)
+        .options(
+            joinedload(LeaveRequest.section).joinedload(Section.class_),
+            joinedload(LeaveRequest.student),
+        )
+        .filter(LeaveRequest.id == request_id)
+        .first()
+    )
     if not lr:
         raise HTTPException(status_code=404, detail="Leave request not found.")
     if lr.section.class_.teacher_id != teacher.id:
@@ -263,7 +278,7 @@ def approved_leaves_for_section(
     """Used by the attendance-review screen to pre-fill a student's status as
     'leave' instead of 'absent' when they have an approved leave for that
     exact date."""
-    section = db.query(Section).filter(Section.id == section_id).first()
+    section = get_section_with_class(db, section_id)
     if not section or section.class_.teacher_id != current_user.id:
         raise HTTPException(status_code=403, detail="You don't own this section's class.")
 

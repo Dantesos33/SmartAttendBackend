@@ -11,7 +11,7 @@ from app.models.enrollment import Enrollment, EnrollmentRequest, EnrollmentReque
 from app.models.attendance import AttendanceSession, AttendanceRecord, AttendanceStatus
 from app.models.notification import Notification
 from app.core.deps import get_current_user
-from app.routers.attendance import _class_attendance_percentage, LOW_ATTENDANCE_THRESHOLD
+from app.routers.attendance import LOW_ATTENDANCE_THRESHOLD
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -30,16 +30,18 @@ def dashboard_stats(db: Session = Depends(get_db), current_user: User = Depends(
         total_students = (
             db.query(Enrollment).filter(Enrollment.class_id.in_(my_class_ids)).count() if my_class_ids else 0
         )
-        today_sessions = (
-            db.query(AttendanceSession)
+        today_totals = (
+            db.query(
+                func.coalesce(func.sum(AttendanceSession.present_count), 0),
+                func.coalesce(func.sum(AttendanceSession.absent_count), 0),
+            )
             .join(Section, AttendanceSession.section_id == Section.id)
             .filter(Section.class_id.in_(my_class_ids), AttendanceSession.date == date.today())
-            .all()
+            .one()
             if my_class_ids
-            else []
+            else (0, 0)
         )
-        present_today = sum(s.present_count for s in today_sessions)
-        absent_today = sum(s.absent_count for s in today_sessions)
+        present_today, absent_today = today_totals
         pending_requests = (
             db.query(EnrollmentRequest)
             .filter(
@@ -112,9 +114,15 @@ def dashboard_stats(db: Session = Depends(get_db), current_user: User = Depends(
     total_students = db.query(User).filter(User.role == UserRole.student).count()
     total_teachers = db.query(User).filter(User.role == UserRole.teacher).count()
     total_classes = db.query(Class).count()
-    today_sessions = db.query(AttendanceSession).filter(AttendanceSession.date == date.today()).all()
-    present_today = sum(s.present_count for s in today_sessions)
-    absent_today = sum(s.absent_count for s in today_sessions)
+    today_totals = (
+        db.query(
+            func.coalesce(func.sum(AttendanceSession.present_count), 0),
+            func.coalesce(func.sum(AttendanceSession.absent_count), 0),
+        )
+        .filter(AttendanceSession.date == date.today())
+        .one()
+    )
+    present_today, absent_today = today_totals
 
     attendance_totals = (
         db.query(

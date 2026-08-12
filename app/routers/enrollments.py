@@ -12,6 +12,7 @@ from app.schemas.class_ import AddStudentsBulkRequest, AddStudentResult
 from app.core.deps import get_current_user, require_role
 from app.core.notifications import notify
 from app.core.security import hash_password
+from app.core.db_helpers import get_section_with_class
 from app.models.notification import NotificationType
 
 router = APIRouter(prefix="/enrollments", tags=["enrollments"])
@@ -23,7 +24,7 @@ def request_enrollment(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.student)),
 ):
-    section = db.query(Section).filter(Section.id == payload.section_id).first()
+    section = get_section_with_class(db, payload.section_id)
     if not section:
         raise HTTPException(status_code=404, detail="Section not found.")
 
@@ -98,7 +99,10 @@ def pending_requests_for_my_classes(
     requests = (
         db.query(EnrollmentRequest)
         .join(Section, EnrollmentRequest.section_id == Section.id)
-        .options(joinedload(EnrollmentRequest.student), joinedload(EnrollmentRequest.section))
+        .options(
+            joinedload(EnrollmentRequest.student),
+            joinedload(EnrollmentRequest.section).joinedload(Section.class_),
+        )
         .filter(
             Section.class_.has(teacher_id=current_user.id),
             EnrollmentRequest.status == EnrollmentRequestStatus.pending,
@@ -122,7 +126,12 @@ def pending_requests_for_my_classes(
 
 
 def _get_owned_request(db: Session, request_id: int, teacher: User) -> EnrollmentRequest:
-    req = db.query(EnrollmentRequest).filter(EnrollmentRequest.id == request_id).first()
+    req = (
+        db.query(EnrollmentRequest)
+        .options(joinedload(EnrollmentRequest.section).joinedload(Section.class_))
+        .filter(EnrollmentRequest.id == request_id)
+        .first()
+    )
     if not req:
         raise HTTPException(status_code=404, detail="Enrollment request not found.")
     if req.section.class_.teacher_id != teacher.id:
@@ -221,7 +230,7 @@ def admin_direct_enroll(
     student = db.query(User).filter(User.id == student_id, User.role == UserRole.student).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found.")
-    section = db.query(Section).filter(Section.id == section_id).first()
+    section = get_section_with_class(db, section_id)
     if not section:
         raise HTTPException(status_code=404, detail="Section not found.")
 
@@ -263,6 +272,7 @@ def admin_direct_unenroll(
     the student."""
     enrollment = (
         db.query(Enrollment)
+        .options(joinedload(Enrollment.section).joinedload(Section.class_))
         .filter(Enrollment.student_id == student_id, Enrollment.class_id == class_id)
         .first()
     )
@@ -300,33 +310,45 @@ def teacher_add_students(
     creating a duplicate. Either way, the student gets the same
     'enrolled_by_teacher' notification, and the one-section-per-class rule
     still applies."""
-    section = db.query(Section).filter(Section.id == payload.section_id).first()
+    section = get_section_with_class(db, payload.section_id)
     if not section:
         raise HTTPException(status_code=404, detail="Section not found.")
     if section.class_.teacher_id != current_user.id:
         raise HTTPException(status_code=403, detail="You don't own this section's class.")
 
+    student_ids = [entry.student_id.strip() for entry in payload.students if entry.student_id.strip()]
+    existing_users = {
+        user.student_id: user
+        for user in db.query(User).filter(User.student_id.in_(student_ids)).all()
+    } if student_ids else {}
+    existing_user_ids = [user.id for user in existing_users.values()]
+    enrolled_user_ids = {
+        row.student_id
+        for row in db.query(Enrollment.student_id)
+        .filter(
+            Enrollment.class_id == section.class_id,
+            Enrollment.student_id.in_(existing_user_ids),
+        )
+        .all()
+    } if existing_user_ids else set()
+
     results: list[AddStudentResult] = []
 
     for entry in payload.students:
         sid = entry.student_id.strip()
-        existing = db.query(User).filter(User.student_id == sid).first()
+        existing = existing_users.get(sid)
 
         if existing and existing.role != UserRole.student:
             results.append(AddStudentResult(student_id=sid, status="error", message="This ID belongs to a non-student account."))
             continue
 
         if existing:
-            already_enrolled = (
-                db.query(Enrollment)
-                .filter(Enrollment.student_id == existing.id, Enrollment.class_id == section.class_id)
-                .first()
-            )
-            if already_enrolled:
+            if existing.id in enrolled_user_ids:
                 results.append(AddStudentResult(student_id=sid, status="error", message="Already enrolled in a section of this class."))
                 continue
             student = existing
             status_label = "existing_enrolled"
+            enrolled_user_ids.add(existing.id)
         else:
             # Default password is the student's own ID + "@123" — simple and
             # memorable for a first login, forced to change immediately after
@@ -381,7 +403,7 @@ async def teacher_add_student_with_photo(
     so they skip the verify-profile gate on first login."""
     from app.routers.recognition import attendance_system
 
-    section = db.query(Section).filter(Section.id == section_id).first()
+    section = get_section_with_class(db, section_id)
     if not section:
         raise HTTPException(status_code=404, detail="Section not found.")
     if section.class_.teacher_id != current_user.id:

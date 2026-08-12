@@ -9,6 +9,7 @@ from app.models.university import University
 from app.models.enrollment import Enrollment, EnrollmentRequest, EnrollmentRequestStatus
 from app.schemas.class_ import ClassCreate, ClassUpdate, ClassOut, ClassBrowseOut, SectionOut
 from app.core.deps import get_current_user, require_role
+from app.core.db_helpers import load_class_for_out
 
 router = APIRouter(prefix="/classes", tags=["classes"])
 
@@ -123,8 +124,7 @@ def create_class(
         )
 
     db.commit()
-    db.refresh(cls)
-    return _class_to_out(cls)
+    return _class_to_out(load_class_for_out(db, cls.id))
 
 
 @router.get("/enrolled", response_model=list[ClassOut])
@@ -270,8 +270,7 @@ def reassign_teacher(
 
     cls.teacher_id = new_teacher_id
     db.commit()
-    db.refresh(cls)
-    return _class_to_out(cls)
+    return _class_to_out(load_class_for_out(db, cls.id))
 
 
 @router.get("/{class_id}/roster")
@@ -291,21 +290,31 @@ def class_roster(
     if current_user.role == UserRole.student:
         raise HTTPException(status_code=403, detail="Not available to students.")
 
+    enrollments = (
+        db.query(Enrollment)
+        .options(joinedload(Enrollment.student))
+        .filter(Enrollment.class_id == class_id)
+        .all()
+    )
+    enrollments_by_section: dict[int, list[Enrollment]] = {}
+    for enrollment in enrollments:
+        enrollments_by_section.setdefault(enrollment.section_id, []).append(enrollment)
+
     result = []
     for section in cls.sections:
-        students = (
-            db.query(Enrollment)
-            .options(joinedload(Enrollment.student))
-            .filter(Enrollment.section_id == section.id)
-            .all()
-        )
+        section_enrollments = enrollments_by_section.get(section.id, [])
         result.append(
             {
                 "section_id": section.id,
                 "section_name": section.name,
                 "students": [
-                    {"id": e.student.id, "name": e.student.name, "email": e.student.email, "avatar_url": e.student.avatar_url}
-                    for e in students
+                    {
+                        "id": e.student.id,
+                        "name": e.student.name,
+                        "email": e.student.email,
+                        "avatar_url": e.student.avatar_url,
+                    }
+                    for e in section_enrollments
                 ],
             }
         )
@@ -318,12 +327,7 @@ def get_class(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    cls = (
-        db.query(Class)
-        .options(joinedload(Class.sections), joinedload(Class.university))
-        .filter(Class.id == class_id)
-        .first()
-    )
+    cls = load_class_for_out(db, class_id)
     if not cls:
         raise HTTPException(status_code=404, detail="Class not found.")
 
@@ -360,17 +364,33 @@ def update_class(
         cls.code = payload.code
     if payload.subject is not None:
         cls.subject = payload.subject
+    if payload.university_id is not None:
+        from app.models.university import University
+        university = db.query(University).filter(University.id == payload.university_id).first()
+        if not university:
+            raise HTTPException(status_code=404, detail="University not found.")
+        cls.university_id = payload.university_id
 
-    for section_update in payload.sections or []:
-        section = db.query(Section).filter(Section.id == section_update.id, Section.class_id == class_id).first()
-        if not section:
-            continue
-        if section_update.schedule_days is not None:
-            section.schedule_days = section_update.schedule_days
-        if section_update.start_time is not None:
-            section.start_time = section_update.start_time
-        if section_update.end_time is not None:
-            section.end_time = section_update.end_time
+    if payload.sections:
+        section_ids = [section_update.id for section_update in payload.sections]
+        sections_by_id = {
+            section.id: section
+            for section in db.query(Section)
+            .filter(Section.class_id == class_id, Section.id.in_(section_ids))
+            .all()
+        }
+        for section_update in payload.sections:
+            section = sections_by_id.get(section_update.id)
+            if not section:
+                continue
+            if section_update.name is not None:
+                section.name = section_update.name.strip()
+            if section_update.schedule_days is not None:
+                section.schedule_days = section_update.schedule_days
+            if section_update.start_time is not None:
+                section.start_time = section_update.start_time
+            if section_update.end_time is not None:
+                section.end_time = section_update.end_time
 
     _validate_schedule(
         db,
@@ -380,8 +400,7 @@ def update_class(
     )
 
     db.commit()
-    db.refresh(cls)
-    return _class_to_out(cls)
+    return _class_to_out(load_class_for_out(db, cls.id))
 
 
 @router.delete("/{class_id}", status_code=204)
