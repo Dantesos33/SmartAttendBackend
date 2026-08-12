@@ -462,11 +462,14 @@ async def teacher_add_student_with_photo(
             db.flush()
             status_label = "created_and_enrolled"
 
-        success, reg_message = attendance_system.register_student_face(
+        success, reg_message, encoding = attendance_system.register_student_face(
             temp_path, student.id, student.name, roll=sid
         )
         if not success:
             raise HTTPException(status_code=400, detail=reg_message)
+
+        if encoding is not None:
+            student.face_encoding_json = attendance_system._encoding_to_json(encoding)
 
         student.avatar_url = f"/media/known_students/{student.id}.jpg"
         if student.name != display_name:

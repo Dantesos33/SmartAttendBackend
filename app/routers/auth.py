@@ -200,11 +200,14 @@ async def upload_profile_photo(
             if not is_valid:
                 raise HTTPException(status_code=400, detail=message)
 
-            success, message = attendance_system.register_student_face(
+            success, message, encoding = attendance_system.register_student_face(
                 temp_path, current_user.id, current_user.name
             )
             if not success:
                 raise HTTPException(status_code=400, detail=message)
+
+            if encoding is not None:
+                current_user.face_encoding_json = attendance_system._encoding_to_json(encoding)
 
             current_user.avatar_url = f"/media/known_students/{current_user.id}.jpg"
         else:

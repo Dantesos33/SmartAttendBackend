@@ -26,6 +26,9 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(Enum(UserRole), nullable=False, default=UserRole.student)
     avatar_url = Column(String(500), nullable=True)
+    # 128-d face embedding persisted as JSON — survives Railway redeploys
+    # when known_students/ on disk is wiped.
+    face_encoding_json = Column(String(5000), nullable=True)
     # True for accounts a teacher created directly (bulk or single add) with a
     # default password — forces a change-password gate on first login,
     # alongside the existing photo-verification gate.

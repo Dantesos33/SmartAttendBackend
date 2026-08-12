@@ -17,6 +17,28 @@ router = APIRouter(tags=["recognition"])
 attendance_system = ClassroomAttendanceSystem(known_students_dir="known_students")
 
 
+def _backfill_face_encodings(db: Session, student_ids: list[int] | None):
+    """Persist embeddings from disk into the DB for students missing them."""
+    if not student_ids:
+        return
+    changed = False
+    for sid in student_ids:
+        user = db.query(User).filter(User.id == sid).first()
+        if not user or user.face_encoding_json:
+            continue
+        file_path = os.path.join("known_students", f"{sid}.jpg")
+        if not os.path.exists(file_path):
+            continue
+        success, _, encoding = attendance_system._register_encoding(
+            file_path, sid, user.name
+        )
+        if success and encoding is not None:
+            user.face_encoding_json = attendance_system._encoding_to_json(encoding)
+            changed = True
+    if changed:
+        db.commit()
+
+
 @router.get("/students")
 def get_students(_: User = Depends(require_role(UserRole.teacher, UserRole.admin))):
     """Every face the recognition engine has been trained on. Note this is
@@ -75,7 +97,7 @@ async def register_student(
 async def recognize_classroom(
     file: UploadFile = File(...),
     section_id: int | None = Form(None),
-    tolerance: float = Form(0.52),
+    tolerance: float = Form(0.65),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
@@ -98,6 +120,19 @@ async def recognize_classroom(
                 .filter(Enrollment.section_id == section_id)
                 .all()
             ]
+            _backfill_face_encodings(db, allowed_student_ids)
+
+        db_encoding_rows = None
+        encoding_query = db.query(User.id, User.name, User.face_encoding_json).filter(
+            User.face_encoding_json.isnot(None),
+            User.role == UserRole.student,
+        )
+        if allowed_student_ids is not None:
+            if allowed_student_ids:
+                encoding_query = encoding_query.filter(User.id.in_(allowed_student_ids))
+            else:
+                encoding_query = encoding_query.filter(User.id == -1)
+        db_encoding_rows = encoding_query.all()
 
         os.makedirs("temp", exist_ok=True)
         temp_path = f"temp/{file.filename}"
@@ -109,6 +144,7 @@ async def recognize_classroom(
             temp_path,
             tolerance=tolerance,
             allowed_student_ids=allowed_student_ids,
+            db_encoding_rows=db_encoding_rows,
         )
 
         if os.path.exists(temp_path):
