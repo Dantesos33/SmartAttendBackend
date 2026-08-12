@@ -412,12 +412,16 @@ class ClassroomAttendanceSystem:
             allowed_student_ids=allowed_student_ids,
         )
 
-        if not self.known_face_encodings:
-            return None, "No student faces registered yet."
+        has_registered_faces = bool(self.known_face_encodings)
+        if not has_registered_faces:
+            print(
+                "No registered face embeddings — running detection-only mode "
+                "(faces will appear as Unknown until students upload profile photos)."
+            )
 
         allowed_set = set(allowed_student_ids) if allowed_student_ids else None
 
-        enrolled_with_faces = None
+        enrolled_with_faces = []
         if allowed_set is not None:
             enrolled_with_faces = [
                 sid for sid in allowed_set if sid in self.known_face_ids
@@ -448,7 +452,9 @@ class ClassroomAttendanceSystem:
 
             if face_encoding is None:
                 unknown_faces += 1
-            elif allowed_set is not None and not enrolled_with_faces:
+            elif allowed_set is not None and has_registered_faces and not enrolled_with_faces:
+                unknown_faces += 1
+            elif not has_registered_faces:
                 unknown_faces += 1
             else:
                 student_id, name, confidence = self._match_face(
@@ -510,6 +516,14 @@ class ClassroomAttendanceSystem:
             "unknown_faces": unknown_faces,
             "faces_detected": len(face_locations),
             "enrolled_with_face_photos": len(registered_in_section),
+            "recognition_available": has_registered_faces,
+            "warning_message": (
+                None
+                if has_registered_faces
+                else "No enrolled students have profile photos registered on the server. "
+                "Faces were detected but all are marked Unknown — ask each student to "
+                "upload their profile photo, then try again."
+            ),
             "face_details": face_details,
         }
 
@@ -524,4 +538,9 @@ class ClassroomAttendanceSystem:
         del classroom_image
         gc.collect()
 
-        return attendance_data, "Recognition complete!"
+        result_message = (
+            "Recognition complete!"
+            if has_registered_faces
+            else "Face detection complete — no registered student photos to match against."
+        )
+        return attendance_data, result_message

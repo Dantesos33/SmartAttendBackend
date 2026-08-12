@@ -17,6 +17,19 @@ router = APIRouter(tags=["recognition"])
 attendance_system = ClassroomAttendanceSystem(known_students_dir="known_students")
 
 
+def _resolve_known_student_path(user: User, sid: int) -> str | None:
+    candidates = [os.path.join("known_students", f"{sid}.jpg")]
+    if user.avatar_url:
+        avatar = user.avatar_url.split("?", 1)[0]
+        if "/known_students/" in avatar:
+            filename = avatar.rsplit("/", 1)[-1]
+            candidates.insert(0, os.path.join("known_students", filename))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def _backfill_face_encodings(db: Session, student_ids: list[int] | None):
     """Persist embeddings from disk into the DB for students missing them."""
     if not student_ids:
@@ -26,8 +39,8 @@ def _backfill_face_encodings(db: Session, student_ids: list[int] | None):
         user = db.query(User).filter(User.id == sid).first()
         if not user or user.face_encoding_json:
             continue
-        file_path = os.path.join("known_students", f"{sid}.jpg")
-        if not os.path.exists(file_path):
+        file_path = _resolve_known_student_path(user, sid)
+        if not file_path:
             continue
         success, _, encoding = attendance_system._register_encoding(
             file_path, sid, user.name
