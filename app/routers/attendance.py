@@ -61,6 +61,19 @@ def save_attendance_session(
     if section.class_.teacher_id != current_user.id:
         raise HTTPException(status_code=403, detail="You don't own this section's class.")
 
+    enrolled_ids = {
+        row.student_id
+        for row in db.query(Enrollment.student_id)
+        .filter(Enrollment.section_id == section.id)
+        .all()
+    }
+    for record in payload.records:
+        if record.student_id not in enrolled_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Student {record.student_id} is not enrolled in this section.",
+            )
+
     present_count = sum(1 for r in payload.records if r.status == AttendanceStatus.present)
     absent_count = sum(1 for r in payload.records if r.status == AttendanceStatus.absent)
     leave_count = sum(1 for r in payload.records if r.status == AttendanceStatus.leave)

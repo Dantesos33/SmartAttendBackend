@@ -2,10 +2,13 @@ import os
 import shutil
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from sqlalchemy.orm import Session
 
 from app.recognition_engine import ClassroomAttendanceSystem
-from app.core.deps import require_role
+from app.core.deps import require_role, get_db
 from app.models.user import User, UserRole
+from app.models.enrollment import Enrollment
+from app.core.db_helpers import get_section_with_class
 
 router = APIRouter(tags=["recognition"])
 
@@ -71,20 +74,42 @@ async def register_student(
 @router.post("/recognize")
 async def recognize_classroom(
     file: UploadFile = File(...),
-    tolerance: float = Form(0.5),
-    _: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
+    section_id: int | None = Form(None),
+    tolerance: float = Form(0.45),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
-    """Raw AI output only — this does NOT save attendance. The frontend shows
-    this to the teacher for manual review, and only the confirmed result gets
-    POSTed to /attendance/sessions afterward."""
+    """Raw AI output only — this does NOT save attendance. When section_id is
+    provided, only students enrolled in that section can be matched."""
     try:
+        allowed_student_ids = None
+        if section_id is not None:
+            section = get_section_with_class(db, section_id)
+            if not section:
+                raise HTTPException(status_code=404, detail="Section not found.")
+            if (
+                current_user.role == UserRole.teacher
+                and section.class_.teacher_id != current_user.id
+            ):
+                raise HTTPException(status_code=403, detail="You don't own this section's class.")
+            allowed_student_ids = [
+                row.student_id
+                for row in db.query(Enrollment.student_id)
+                .filter(Enrollment.section_id == section_id)
+                .all()
+            ]
+
         os.makedirs("temp", exist_ok=True)
         temp_path = f"temp/{file.filename}"
 
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        attendance_data, message = attendance_system.recognize_classroom(temp_path, tolerance=tolerance)
+        attendance_data, message = attendance_system.recognize_classroom(
+            temp_path,
+            tolerance=tolerance,
+            allowed_student_ids=allowed_student_ids,
+        )
 
         if os.path.exists(temp_path):
             os.remove(temp_path)
