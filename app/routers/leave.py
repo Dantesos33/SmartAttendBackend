@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import datetime, date
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -8,12 +8,83 @@ from app.models.user import User, UserRole
 from app.models.class_ import Section
 from app.models.enrollment import Enrollment
 from app.models.leave import LeaveRequest, LeaveRequestStatus
+from app.models.attendance import AttendanceSession, AttendanceRecord, AttendanceStatus
 from app.schemas.leave import LeaveRequestCreate, LeaveRequestOut
 from app.core.deps import get_current_user, require_role
 from app.core.notifications import notify
 from app.models.notification import NotificationType
 
 router = APIRouter(prefix="/leave-requests", tags=["leave-requests"])
+
+
+def _refresh_session_counts(db: Session, session: AttendanceSession) -> None:
+    records = (
+        db.query(AttendanceRecord)
+        .filter(AttendanceRecord.session_id == session.id)
+        .all()
+    )
+    session.present_count = sum(1 for r in records if r.status == AttendanceStatus.present)
+    session.absent_count = sum(1 for r in records if r.status == AttendanceStatus.absent)
+    session.leave_count = sum(1 for r in records if r.status == AttendanceStatus.leave)
+
+
+def _record_leave_attendance(
+    db: Session,
+    lr: LeaveRequest,
+    status: AttendanceStatus,
+    teacher_id: int,
+) -> AttendanceSession:
+    """When a teacher resolves a leave request, write present/absent for that date."""
+    session = (
+        db.query(AttendanceSession)
+        .filter(
+            AttendanceSession.section_id == lr.section_id,
+            AttendanceSession.date == lr.date,
+        )
+        .first()
+    )
+    if not session:
+        session = AttendanceSession(
+            section_id=lr.section_id,
+            taken_by=teacher_id,
+            date=lr.date,
+            present_count=0,
+            absent_count=0,
+            leave_count=0,
+        )
+        db.add(session)
+        db.flush()
+
+    record = (
+        db.query(AttendanceRecord)
+        .filter(
+            AttendanceRecord.session_id == session.id,
+            AttendanceRecord.student_id == lr.student_id,
+        )
+        .first()
+    )
+    if record:
+        record.status = status
+    else:
+        db.add(
+            AttendanceRecord(
+                session_id=session.id,
+                student_id=lr.student_id,
+                status=status,
+            )
+        )
+        notify(
+            db,
+            user_id=lr.student_id,
+            type_=NotificationType.attendance_result,
+            title=f"You were marked {status.value.capitalize()} in {lr.section.class_.name}",
+            body=f"Section {lr.section.name} — {lr.date}",
+            related_id=session.id,
+        )
+
+    db.flush()
+    _refresh_session_counts(db, session)
+    return session
 
 
 def _to_out(lr: LeaveRequest) -> LeaveRequestOut:
@@ -136,15 +207,18 @@ def accept_leave_request(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher)),
 ):
+    """Teacher marks the student Present for the requested leave date."""
     lr = _get_owned_leave_request(db, request_id, current_user)
     lr.status = LeaveRequestStatus.approved
     lr.resolved_at = datetime.utcnow()
+    _record_leave_attendance(db, lr, AttendanceStatus.present, current_user.id)
 
     notify(
         db,
         user_id=lr.student_id,
         type_=NotificationType.leave_approved,
-        title=f"Your leave request for {lr.section.class_.name} on {lr.date} was approved",
+        title=f"Leave approved — marked Present for {lr.section.class_.name}",
+        body=f"Section {lr.section.name} on {lr.date}",
         related_id=lr.id,
     )
 
@@ -159,15 +233,18 @@ def reject_leave_request(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher)),
 ):
+    """Teacher marks the student Absent for the requested leave date."""
     lr = _get_owned_leave_request(db, request_id, current_user)
     lr.status = LeaveRequestStatus.rejected
     lr.resolved_at = datetime.utcnow()
+    _record_leave_attendance(db, lr, AttendanceStatus.absent, current_user.id)
 
     notify(
         db,
         user_id=lr.student_id,
         type_=NotificationType.leave_rejected,
-        title=f"Your leave request for {lr.section.class_.name} on {lr.date} was declined",
+        title=f"Leave declined — marked Absent for {lr.section.class_.name}",
+        body=f"Section {lr.section.name} on {lr.date}",
         related_id=lr.id,
     )
 

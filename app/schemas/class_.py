@@ -34,6 +34,7 @@ class AddStudentsBulkRequest(BaseModel):
 
 class AddStudentResult(BaseModel):
     student_id: str
+    user_id: int | None = None
     status: str  # "created_and_enrolled" | "existing_enrolled" | "error"
     message: str
 

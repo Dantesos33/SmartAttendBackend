@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+import os
+import shutil
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -363,3 +365,123 @@ def teacher_add_students(
 
     db.commit()
     return results
+
+
+@router.post("/add-student-with-photo", response_model=AddStudentResult)
+async def teacher_add_student_with_photo(
+    section_id: int = Form(...),
+    name: str = Form(...),
+    student_id: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.teacher)),
+):
+    """Add an unrecognized face from attendance review — enrolls the student,
+    registers the cropped face for AI recognition, and sets their profile photo
+    so they skip the verify-profile gate on first login."""
+    from app.routers.recognition import attendance_system
+
+    section = db.query(Section).filter(Section.id == section_id).first()
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found.")
+    if section.class_.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You don't own this section's class.")
+
+    sid = student_id.strip()
+    display_name = name.strip()
+    if not sid or not display_name:
+        raise HTTPException(status_code=400, detail="Name and student ID are required.")
+
+    existing = db.query(User).filter(User.student_id == sid).first()
+    if existing and existing.role != UserRole.student:
+        return AddStudentResult(
+            student_id=sid,
+            status="error",
+            message="This ID belongs to a non-student account.",
+        )
+
+    os.makedirs("temp", exist_ok=True)
+    temp_path = f"temp/enroll_face_{sid}_{file.filename}"
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        is_valid, message = attendance_system.verify_face_quality(temp_path)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=message)
+
+        if existing:
+            already_enrolled = (
+                db.query(Enrollment)
+                .filter(
+                    Enrollment.student_id == existing.id,
+                    Enrollment.class_id == section.class_id,
+                )
+                .first()
+            )
+            if already_enrolled:
+                return AddStudentResult(
+                    student_id=sid,
+                    status="error",
+                    message="Already enrolled in a section of this class.",
+                )
+            student = existing
+            status_label = "existing_enrolled"
+        else:
+            temp_password = f"{sid}@123"
+            student = User(
+                name=display_name,
+                student_id=sid,
+                password_hash=hash_password(temp_password),
+                role=UserRole.student,
+                must_change_password=True,
+            )
+            db.add(student)
+            db.flush()
+            status_label = "created_and_enrolled"
+
+        success, reg_message = attendance_system.register_student_face(
+            temp_path, student.id, student.name, roll=sid
+        )
+        if not success:
+            raise HTTPException(status_code=400, detail=reg_message)
+
+        student.avatar_url = f"/media/known_students/{student.id}.jpg"
+        if student.name != display_name:
+            student.name = display_name
+
+        enrollment = Enrollment(
+            student_id=student.id,
+            section_id=section.id,
+            class_id=section.class_id,
+        )
+        db.add(enrollment)
+
+        notify(
+            db,
+            user_id=student.id,
+            type_=NotificationType.enrolled_by_teacher,
+            title=f"You've been enrolled in {section.class_.name} by {current_user.name}",
+            body=(
+                f"Section {section.name}. Your profile photo was added from attendance capture."
+                if status_label == "created_and_enrolled"
+                else f"Section {section.name}."
+            ),
+            related_id=section.class_id,
+        )
+
+        result_message = (
+            f"Account created (login ID: {sid}, temp password: {sid}@123) and enrolled."
+            if status_label == "created_and_enrolled"
+            else "Existing account enrolled with updated profile photo."
+        )
+        db.commit()
+        return AddStudentResult(
+            student_id=sid,
+            user_id=student.id,
+            status=status_label,
+            message=result_message,
+        )
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)

@@ -2,6 +2,7 @@ import face_recognition
 import cv2
 import numpy as np
 import os
+import base64
 from datetime import datetime
 import json
 
@@ -142,6 +143,24 @@ class ClassroomAttendanceSystem:
         except Exception as e:
             return False, f"Error removing student {student_id}: {str(e)}"
 
+    def _encode_bgr_jpeg_base64(self, bgr_image, quality=82):
+        ok, buffer = cv2.imencode(".jpg", bgr_image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return None
+        return base64.b64encode(buffer).decode("utf-8")
+
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=85):
+        h, w = rgb_image.shape[:2]
+        top = max(0, top)
+        left = max(0, left)
+        bottom = min(h, bottom)
+        right = min(w, right)
+        if bottom <= top or right <= left:
+            return None
+        crop = rgb_image[top:bottom, left:right]
+        crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+        return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality)
+
     def recognize_classroom(self, classroom_image_path, tolerance=0.5):
         """Recognize students in a classroom image. Returns student_id (real
         database id) for every match, not just a name string."""
@@ -160,7 +179,9 @@ class ClassroomAttendanceSystem:
         unknown_faces = 0
         face_details = []
 
-        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+        for face_index, ((top, right, bottom, left), face_encoding) in enumerate(
+            zip(face_locations, face_encodings)
+        ):
             matches = face_recognition.compare_faces(
                 self.known_face_encodings, face_encoding, tolerance=tolerance
             )
@@ -184,10 +205,14 @@ class ClassroomAttendanceSystem:
                 unknown_faces += 1
 
             face_details.append({
+                "face_index": face_index,
                 "student_id": student_id,
                 "name": name,
                 "confidence": float(confidence),
-                "location": (top, right, bottom, left),
+                "location": {"top": top, "right": right, "bottom": bottom, "left": left},
+                "crop_base64": self._encode_rgb_crop_base64(
+                    classroom_image, top, right, bottom, left
+                ),
             })
 
             color = (0, 255, 0) if student_id is not None else (0, 0, 255)
@@ -215,5 +240,8 @@ class ClassroomAttendanceSystem:
         annotated_path = f"output/annotated_classroom_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         cv2.imwrite(annotated_path, classroom_image_cv)
         attendance_data["annotated_image_path"] = annotated_path
+        attendance_data["annotated_image_base64"] = self._encode_bgr_jpeg_base64(
+            classroom_image_cv
+        )
 
         return attendance_data, "Recognition complete!"
