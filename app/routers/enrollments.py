@@ -349,6 +349,7 @@ def teacher_add_students(
             student = existing
             status_label = "existing_enrolled"
             enrolled_user_ids.add(existing.id)
+            message = f"{existing.name} already has an account and was enrolled in this class."
         else:
             # Default password is the student's own ID + "@123" — simple and
             # memorable for a first login, forced to change immediately after
@@ -364,6 +365,8 @@ def teacher_add_students(
             db.add(student)
             db.flush()
             status_label = "created_and_enrolled"
+            existing_users[sid] = student
+            enrolled_user_ids.add(student.id)
 
         enrollment = Enrollment(student_id=student.id, section_id=section.id, class_id=section.class_id)
         db.add(enrollment)
@@ -381,9 +384,16 @@ def teacher_add_students(
         message = (
             f"Account created (login ID: {sid}, temp password: {sid}@123) and enrolled."
             if status_label == "created_and_enrolled"
-            else "Existing account enrolled."
+            else message
         )
-        results.append(AddStudentResult(student_id=sid, status=status_label, message=message))
+        results.append(
+            AddStudentResult(
+                student_id=sid,
+                user_id=student.id,
+                status=status_label,
+                message=message,
+            )
+        )
 
     db.commit()
     return results
@@ -428,10 +438,6 @@ async def teacher_add_student_with_photo(
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        is_valid, message = attendance_system.verify_face_quality(temp_path)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=message)
-
         if existing:
             already_enrolled = (
                 db.query(Enrollment)
@@ -444,23 +450,49 @@ async def teacher_add_student_with_photo(
             if already_enrolled:
                 return AddStudentResult(
                     student_id=sid,
+                    user_id=existing.id,
                     status="error",
                     message="Already enrolled in a section of this class.",
                 )
-            student = existing
-            status_label = "existing_enrolled"
-        else:
-            temp_password = f"{sid}@123"
-            student = User(
-                name=display_name,
-                student_id=sid,
-                password_hash=hash_password(temp_password),
-                role=UserRole.student,
-                must_change_password=True,
+
+            enrollment = Enrollment(
+                student_id=existing.id,
+                section_id=section.id,
+                class_id=section.class_id,
             )
-            db.add(student)
-            db.flush()
-            status_label = "created_and_enrolled"
+            db.add(enrollment)
+
+            notify(
+                db,
+                user_id=existing.id,
+                type_=NotificationType.enrolled_by_teacher,
+                title=f"You've been enrolled in {section.class_.name} by {current_user.name}",
+                body=f"Section {section.name}.",
+                related_id=section.class_id,
+            )
+
+            db.commit()
+            return AddStudentResult(
+                student_id=sid,
+                user_id=existing.id,
+                status="existing_enrolled",
+                message=f"{existing.name} already has an account and was enrolled in this class.",
+            )
+
+        is_valid, message = attendance_system.verify_face_quality(temp_path)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=message)
+
+        temp_password = f"{sid}@123"
+        student = User(
+            name=display_name,
+            student_id=sid,
+            password_hash=hash_password(temp_password),
+            role=UserRole.student,
+            must_change_password=True,
+        )
+        db.add(student)
+        db.flush()
 
         success, reg_message, encoding = attendance_system.register_student_face(
             temp_path, student.id, student.name, roll=sid
@@ -472,8 +504,6 @@ async def teacher_add_student_with_photo(
             student.face_encoding_json = attendance_system._encoding_to_json(encoding)
 
         student.avatar_url = f"/media/known_students/{student.id}.jpg"
-        if student.name != display_name:
-            student.name = display_name
 
         enrollment = Enrollment(
             student_id=student.id,
@@ -488,24 +518,18 @@ async def teacher_add_student_with_photo(
             type_=NotificationType.enrolled_by_teacher,
             title=f"You've been enrolled in {section.class_.name} by {current_user.name}",
             body=(
-                f"Section {section.name}. Your profile photo was added from attendance capture."
-                if status_label == "created_and_enrolled"
-                else f"Section {section.name}."
+                f"Section {section.name}. Your profile photo was added from attendance capture. "
+                f"Log in with ID {sid} and password {sid}@123."
             ),
             related_id=section.class_id,
         )
 
-        result_message = (
-            f"Account created (login ID: {sid}, temp password: {sid}@123) and enrolled."
-            if status_label == "created_and_enrolled"
-            else "Existing account enrolled with updated profile photo."
-        )
         db.commit()
         return AddStudentResult(
             student_id=sid,
             user_id=student.id,
-            status=status_label,
-            message=result_message,
+            status="created_and_enrolled",
+            message=f"Account created (login ID: {sid}, temp password: {sid}@123) and enrolled.",
         )
     finally:
         if os.path.exists(temp_path):

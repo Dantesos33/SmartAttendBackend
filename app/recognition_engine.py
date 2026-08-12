@@ -7,7 +7,7 @@ import gc
 from datetime import datetime
 import json
 
-# Keep detection memory low on small Railway instances.
+MIN_CONFIDENCE = 0.48
 MAX_DETECT_EDGE = 1280
 MAX_ANNOTATED_EDGE = 1200
 
@@ -374,6 +374,59 @@ class ClassroomAttendanceSystem:
             return encodings[0]
         return None
 
+    def _assign_faces_to_students(
+        self,
+        face_encodings_by_index: dict[int, np.ndarray | None],
+        tolerance: float,
+        allowed_set: set | None,
+        min_confidence: float = MIN_CONFIDENCE,
+    ) -> dict[int, tuple[int | None, str, float]]:
+        """One enrolled student can match at most one face; weak matches become Unknown."""
+        candidates: list[tuple[int, int, str, float, float]] = []
+
+        for face_index, encoding in face_encodings_by_index.items():
+            if encoding is None:
+                continue
+            distances = face_recognition.face_distance(self.known_face_encodings, encoding)
+            for idx in np.argsort(distances):
+                distance = float(distances[idx])
+                if distance > tolerance:
+                    break
+                student_id = self.known_face_ids[idx]
+                if allowed_set is not None and student_id not in allowed_set:
+                    continue
+                confidence = 1 - distance
+                if confidence < min_confidence:
+                    continue
+                candidates.append(
+                    (
+                        face_index,
+                        student_id,
+                        self.known_face_names[idx],
+                        confidence,
+                        distance,
+                    )
+                )
+
+        candidates.sort(key=lambda item: item[4])
+
+        assigned_faces: set[int] = set()
+        assigned_students: set[int] = set()
+        assignments: dict[int, tuple[int | None, str, float]] = {}
+
+        for face_index, student_id, name, confidence, _distance in candidates:
+            if face_index in assigned_faces or student_id in assigned_students:
+                continue
+            assignments[face_index] = (student_id, name, confidence)
+            assigned_faces.add(face_index)
+            assigned_students.add(student_id)
+
+        for face_index in face_encodings_by_index:
+            if face_index not in assignments:
+                assignments[face_index] = (None, "Unknown", 0.0)
+
+        return assignments
+
     def _match_face(self, face_encoding, tolerance, allowed_set=None):
         """Pick the closest known face within tolerance; when section-scoped,
         skip matches for students outside the allowed enrollment set."""
@@ -438,13 +491,27 @@ class ClassroomAttendanceSystem:
 
         face_locations = self._detect_face_locations(classroom_image)
 
+        face_encodings_by_index: dict[int, np.ndarray | None] = {}
+        for face_index, location in enumerate(face_locations):
+            face_encodings_by_index[face_index] = self._encode_face_at_location(
+                classroom_image, location
+            )
+
+        assignments: dict[int, tuple[int | None, str, float]] = {}
+        if has_registered_faces:
+            assignments = self._assign_faces_to_students(
+                face_encodings_by_index,
+                tolerance=tolerance,
+                allowed_set=allowed_set,
+            )
+
         present_student_ids = []
         unknown_faces = 0
         face_details = []
 
         for face_index, location in enumerate(face_locations):
             top, right, bottom, left = location
-            face_encoding = self._encode_face_at_location(classroom_image, location)
+            face_encoding = face_encodings_by_index.get(face_index)
 
             student_id = None
             name = "Unknown"
@@ -452,15 +519,11 @@ class ClassroomAttendanceSystem:
 
             if face_encoding is None:
                 unknown_faces += 1
-            elif allowed_set is not None and has_registered_faces and not enrolled_with_faces:
-                unknown_faces += 1
             elif not has_registered_faces:
                 unknown_faces += 1
             else:
-                student_id, name, confidence = self._match_face(
-                    face_encoding,
-                    tolerance=tolerance,
-                    allowed_set=allowed_set,
+                student_id, name, confidence = assignments.get(
+                    face_index, (None, "Unknown", 0.0)
                 )
                 if student_id is None:
                     unknown_faces += 1
