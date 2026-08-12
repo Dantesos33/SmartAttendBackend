@@ -3,8 +3,13 @@ import cv2
 import numpy as np
 import os
 import base64
+import gc
 from datetime import datetime
 import json
+
+# Keep detection memory low on small Railway instances.
+MAX_DETECT_EDGE = 1280
+MAX_ANNOTATED_EDGE = 1200
 
 class ClassroomAttendanceSystem:
     """
@@ -113,10 +118,11 @@ class ClassroomAttendanceSystem:
                 self._register_encoding(filepath, student_id, name)
         print(f"Loaded {len(self.known_face_ids)} known students.")
 
-    def _register_encoding(self, image_path, student_id, name, persist_only=False):
+    def _register_encoding(self, image_path, student_id, name):
         try:
             image = face_recognition.load_image_file(image_path)
-            locations = face_recognition.face_locations(image)
+            image, _ = self._downscale_rgb(image, MAX_DETECT_EDGE)
+            locations = face_recognition.face_locations(image, number_of_times_to_upsample=1)
             if not locations:
                 return False, "No face detected in image.", None
             if len(locations) > 1:
@@ -125,10 +131,8 @@ class ClassroomAttendanceSystem:
             encodings = face_recognition.face_encodings(
                 image,
                 [locations[0]],
-                num_jitters=2,
+                num_jitters=1,
             )
-            if not encodings:
-                encodings = face_recognition.face_encodings(image, [locations[0]], num_jitters=1)
             if not encodings:
                 return False, "Could not encode face from image.", None
 
@@ -149,10 +153,11 @@ class ClassroomAttendanceSystem:
         before accepting it as a profile photo (exactly one clear face)."""
         try:
             image = face_recognition.load_image_file(image_path)
-            encodings = face_recognition.face_encodings(image)
-            if len(encodings) == 0:
+            image, _ = self._downscale_rgb(image, MAX_DETECT_EDGE)
+            locations = face_recognition.face_locations(image, number_of_times_to_upsample=1)
+            if len(locations) == 0:
                 return False, "No face detected. Please upload a clear photo of your face."
-            if len(encodings) > 1:
+            if len(locations) > 1:
                 return False, "Multiple faces detected. Please upload a photo with only yourself in frame."
             return True, "Face detected clearly."
         except Exception as e:
@@ -198,7 +203,15 @@ class ClassroomAttendanceSystem:
         except Exception as e:
             return False, f"Error removing student {student_id}: {str(e)}"
 
-    def _encode_bgr_jpeg_base64(self, bgr_image, quality=82):
+    def _encode_bgr_jpeg_base64(self, bgr_image, quality=75, max_edge=MAX_ANNOTATED_EDGE):
+        h, w = bgr_image.shape[:2]
+        if max(h, w) > max_edge:
+            scale = max_edge / max(h, w)
+            bgr_image = cv2.resize(
+                bgr_image,
+                (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
         ok, buffer = cv2.imencode(".jpg", bgr_image, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not ok:
             return None
@@ -261,59 +274,104 @@ class ClassroomAttendanceSystem:
             for top, right, bottom, left in locations
         ]
 
-    def _flip_locations(self, locations, width):
-        flipped = []
-        for top, right, bottom, left in locations:
-            flipped.append((top, width - left, bottom, width - right))
-        return flipped
+    @staticmethod
+    def _downscale_rgb(rgb_image, max_edge):
+        h, w = rgb_image.shape[:2]
+        longest = max(h, w)
+        if longest <= max_edge:
+            return rgb_image, 1.0
+        scale = max_edge / longest
+        resized = cv2.resize(
+            rgb_image,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+        return resized, scale
+
+    def prepare_known_faces(self, db_encoding_rows=None, allowed_student_ids=None):
+        """Load only the embeddings needed for this recognition request."""
+        self.known_face_encodings = []
+        self.known_face_ids = []
+        self.known_face_names = []
+
+        if db_encoding_rows:
+            self.load_db_encodings(db_encoding_rows)
+
+        target_ids = allowed_student_ids
+        if target_ids is None:
+            target_ids = [
+                int(stem)
+                for stem in (
+                    os.path.splitext(name)[0]
+                    for name in os.listdir(self.known_students_dir)
+                    if name.lower().endswith((".png", ".jpg", ".jpeg"))
+                    and os.path.splitext(name)[0].isdigit()
+                )
+            ]
+
+        for student_id in target_ids:
+            if student_id in self.known_face_ids:
+                continue
+            filepath = os.path.join(self.known_students_dir, f"{student_id}.jpg")
+            if not os.path.exists(filepath):
+                continue
+            name = self.metadata.get(str(student_id), {}).get("name", f"Student {student_id}")
+            self._register_encoding(filepath, student_id, name)
 
     def _detect_face_locations(self, rgb_image):
-        """Multi-pass detection: padded edges + multiple scales + upsampling."""
-        h, w = rgb_image.shape[:2]
-        pad_y = max(20, int(h * 0.08))
-        pad_x = max(20, int(w * 0.08))
-        padded = cv2.copyMakeBorder(
-            rgb_image, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REPLICATE
-        )
-
+        """Memory-safe detection: downscale first, add extra passes only if needed."""
+        detect_img, det_scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
+        inv_scale = 1.0 / det_scale
         collected = []
-        for source, off_y, off_x in ((padded, pad_y, pad_x), (rgb_image, 0, 0)):
-            for scale in (1.0, 1.25, 1.5):
-                if scale == 1.0:
-                    img = source
-                else:
-                    sh, sw = source.shape[:2]
-                    img = cv2.resize(source, (int(sw * scale), int(sh * scale)))
-                for upsample in (1, 2, 3):
-                    batch = face_recognition.face_locations(
-                        img,
-                        number_of_times_to_upsample=upsample,
-                    )
-                    batch = self._scale_locations(batch, scale)
-                    batch = self._offset_locations(batch, off_y, off_x)
-                    collected.extend(batch)
 
-        flipped = np.fliplr(rgb_image)
-        for upsample in (1, 2):
+        def add_pass(img, offset_y=0, offset_x=0, upsample=1):
             batch = face_recognition.face_locations(
-                flipped,
+                img,
                 number_of_times_to_upsample=upsample,
             )
-            collected.extend(self._flip_locations(batch, w))
+            if offset_y or offset_x:
+                batch = self._offset_locations(batch, offset_y, offset_x)
+            collected.extend(self._scale_locations(batch, inv_scale))
 
+        add_pass(detect_img, upsample=1)
         merged = self._merge_face_locations(collected)
-        print(f"Detected {len(merged)} face(s) after multi-pass detection.")
+
+        if len(merged) < 4:
+            h, w = detect_img.shape[:2]
+            pad = max(12, int(min(h, w) * 0.05))
+            padded = cv2.copyMakeBorder(
+                detect_img, pad, pad, pad, pad, cv2.BORDER_REPLICATE
+            )
+            add_pass(padded, offset_y=pad, offset_x=pad, upsample=1)
+            del padded
+            merged = self._merge_face_locations(collected)
+
+        if len(merged) < 4:
+            add_pass(detect_img, upsample=2)
+            merged = self._merge_face_locations(collected)
+
+        del detect_img
+        gc.collect()
+        print(f"Detected {len(merged)} face(s) after memory-safe detection.")
         return merged
 
     def _encode_face_at_location(self, rgb_image, location):
-        for jitters in (2, 1):
-            encodings = face_recognition.face_encodings(
-                rgb_image,
-                [location],
-                num_jitters=jitters,
+        work_image, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
+        if scale != 1.0:
+            top, right, bottom, left = location
+            location = (
+                int(top * scale),
+                int(right * scale),
+                int(bottom * scale),
+                int(left * scale),
             )
-            if encodings:
-                return encodings[0]
+        encodings = face_recognition.face_encodings(
+            work_image,
+            [location],
+            num_jitters=1,
+        )
+        if encodings:
+            return encodings[0]
         return None
 
     def _match_face(self, face_encoding, tolerance, allowed_set=None):
@@ -348,10 +406,11 @@ class ClassroomAttendanceSystem:
 
         When allowed_student_ids is provided, only students enrolled in the
         target section can be matched — others appear as unknown faces."""
-        # Reload from disk so newly registered profile photos are included.
-        self.load_known_students_from_dir()
-        if db_encoding_rows:
-            self.load_db_encodings(db_encoding_rows)
+        # Load only section-scoped embeddings — avoid reloading every student photo.
+        self.prepare_known_faces(
+            db_encoding_rows=db_encoding_rows,
+            allowed_student_ids=allowed_student_ids,
+        )
 
         if not self.known_face_encodings:
             return None, "No student faces registered yet."
@@ -459,7 +518,10 @@ class ClassroomAttendanceSystem:
         cv2.imwrite(annotated_path, classroom_image_cv)
         attendance_data["annotated_image_path"] = annotated_path
         attendance_data["annotated_image_base64"] = self._encode_bgr_jpeg_base64(
-            classroom_image_cv
+            classroom_image_cv, quality=72, max_edge=MAX_ANNOTATED_EDGE
         )
+
+        del classroom_image
+        gc.collect()
 
         return attendance_data, "Recognition complete!"
