@@ -12,12 +12,49 @@ from app.schemas.auth import (
     TokenResponse,
     UserOut,
     ChangePasswordRequest,
+    ForgotPasswordVerifyRequest,
+    ForgotPasswordResetRequest,
     UpdateProfileRequest,
 )
 from app.core.security import hash_password, verify_password, create_access_token
 from app.core.deps import get_current_user, require_role
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+_RESET_MISMATCH = "No account matches these details."
+
+
+def _find_user_for_password_reset(
+    role: str,
+    email: str | None,
+    student_id: str | None,
+    db: Session,
+) -> User:
+    """In-app reset: students by student ID, teachers/admins by email."""
+    if role == "student":
+        sid = (student_id or "").strip()
+        if not sid:
+            raise HTTPException(status_code=400, detail=_RESET_MISMATCH)
+        user = (
+            db.query(User)
+            .filter(User.student_id == sid, User.role == UserRole.student)
+            .first()
+        )
+    else:
+        if not email:
+            raise HTTPException(status_code=400, detail=_RESET_MISMATCH)
+        user = (
+            db.query(User)
+            .filter(
+                User.email == email,
+                User.role.in_([UserRole.teacher, UserRole.admin]),
+            )
+            .first()
+        )
+
+    if not user:
+        raise HTTPException(status_code=400, detail=_RESET_MISMATCH)
+    return user
 
 
 @router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -102,6 +139,39 @@ def change_password(
 
     current_user.password_hash = hash_password(payload.new_password)
     current_user.must_change_password = False
+    db.commit()
+    return None
+
+
+@router.post("/forgot-password/verify", status_code=204)
+def forgot_password_verify(
+    payload: ForgotPasswordVerifyRequest,
+    db: Session = Depends(get_db),
+):
+    """Verify identity for in-app password reset (no email is sent)."""
+    _find_user_for_password_reset(
+        payload.role,
+        payload.email,
+        payload.student_id,
+        db,
+    )
+    return None
+
+
+@router.post("/forgot-password/reset", status_code=204)
+def forgot_password_reset(
+    payload: ForgotPasswordResetRequest,
+    db: Session = Depends(get_db),
+):
+    """Reset password after role-specific verification."""
+    user = _find_user_for_password_reset(
+        payload.role,
+        payload.email,
+        payload.student_id,
+        db,
+    )
+    user.password_hash = hash_password(payload.new_password)
+    user.must_change_password = False
     db.commit()
     return None
 

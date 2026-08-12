@@ -1,6 +1,9 @@
 from pydantic import BaseModel, EmailStr, field_validator, model_validator
+from typing import Literal
 
 from app.models.user import UserRole
+
+ForgotPasswordRole = Literal["student", "teacher"]
 
 
 class RegisterRequest(BaseModel):
@@ -52,6 +55,16 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+def _validate_password_strength(v: str) -> str:
+    if len(v) < 8:
+        raise ValueError("Password must be at least 8 characters long.")
+    if not any(c.isdigit() for c in v):
+        raise ValueError("Password must contain at least one number.")
+    if not any(c.isalpha() for c in v):
+        raise ValueError("Password must contain at least one letter.")
+    return v
+
+
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
@@ -59,13 +72,53 @@ class ChangePasswordRequest(BaseModel):
     @field_validator("new_password")
     @classmethod
     def password_strength(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters long.")
-        if not any(c.isdigit() for c in v):
-            raise ValueError("Password must contain at least one number.")
-        if not any(c.isalpha() for c in v):
-            raise ValueError("Password must contain at least one letter.")
-        return v
+        return _validate_password_strength(v)
+
+
+class ForgotPasswordVerifyRequest(BaseModel):
+    role: ForgotPasswordRole
+    email: EmailStr | None = None
+    student_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_identifiers(self):
+        if self.role == "student":
+            sid = (self.student_id or "").strip()
+            if not sid:
+                raise ValueError("Student ID is required for student accounts.")
+            self.student_id = sid
+            self.email = None
+        else:
+            if not self.email:
+                raise ValueError("Email is required for teacher accounts.")
+            self.student_id = None
+        return self
+
+
+class ForgotPasswordResetRequest(BaseModel):
+    role: ForgotPasswordRole
+    email: EmailStr | None = None
+    student_id: str | None = None
+    new_password: str
+
+    @model_validator(mode="after")
+    def validate_identifiers(self):
+        if self.role == "student":
+            sid = (self.student_id or "").strip()
+            if not sid:
+                raise ValueError("Student ID is required for student accounts.")
+            self.student_id = sid
+            self.email = None
+        else:
+            if not self.email:
+                raise ValueError("Email is required for teacher accounts.")
+            self.student_id = None
+        return self
+
+    @field_validator("new_password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        return _validate_password_strength(v)
 
 
 class UpdateProfileRequest(BaseModel):
