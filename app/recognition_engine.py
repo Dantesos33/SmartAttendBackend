@@ -161,12 +161,59 @@ class ClassroomAttendanceSystem:
         crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
         return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality)
 
+    @staticmethod
+    def _box_area(top, right, bottom, left):
+        return max(0, bottom - top) * max(0, right - left)
+
+    @staticmethod
+    def _boxes_overlap(a, b):
+        a_top, a_right, a_bottom, a_left = a
+        b_top, b_right, b_bottom, b_left = b
+        inter_top = max(a_top, b_top)
+        inter_left = max(a_left, b_left)
+        inter_bottom = min(a_bottom, b_bottom)
+        inter_right = min(a_right, b_right)
+        inter_area = ClassroomAttendanceSystem._box_area(
+            inter_top, inter_right, inter_bottom, inter_left
+        )
+        if inter_area <= 0:
+            return False
+        a_area = ClassroomAttendanceSystem._box_area(a_top, a_right, a_bottom, a_left)
+        b_area = ClassroomAttendanceSystem._box_area(b_top, b_right, b_bottom, b_left)
+        union = a_area + b_area - inter_area
+        return union > 0 and (inter_area / union) >= 0.35
+
+    def _merge_face_locations(self, locations):
+        """Deduplicate overlapping detections, keeping the largest box."""
+        unique = []
+        for loc in sorted(locations, key=lambda box: self._box_area(*box), reverse=True):
+            if not any(self._boxes_overlap(loc, kept) for kept in unique):
+                unique.append(loc)
+        return unique
+
+    def _detect_face_locations(self, rgb_image):
+        """Run multiple HOG passes and merge — improves recall for group photos."""
+        passes = [
+            face_recognition.face_locations(rgb_image, number_of_times_to_upsample=1),
+            face_recognition.face_locations(rgb_image, number_of_times_to_upsample=2),
+        ]
+        merged = self._merge_face_locations([loc for batch in passes for loc in batch])
+        print(f"Detected {len(merged)} face(s) after merged HOG passes.")
+        return merged
+
+    def _encode_face_at_location(self, rgb_image, location):
+        encodings = face_recognition.face_encodings(
+            rgb_image,
+            [location],
+            num_jitters=1,
+        )
+        return encodings[0] if encodings else None
+
     def recognize_classroom(
         self,
         classroom_image_path,
-        tolerance=0.45,
+        tolerance=0.52,
         allowed_student_ids=None,
-        min_confidence=0.55,
     ):
         """Recognize students in a classroom image. Returns student_id (real
         database id) for every match, not just a name string.
@@ -178,32 +225,21 @@ class ClassroomAttendanceSystem:
 
         allowed_set = set(allowed_student_ids) if allowed_student_ids else None
 
-        candidate_indices = list(range(len(self.known_face_ids)))
+        # Match only enrolled students when section-scoped, but keep the full
+        # global index so we can still resolve names for allowed IDs.
         if allowed_set is not None:
             candidate_indices = [
                 i for i, sid in enumerate(self.known_face_ids) if sid in allowed_set
             ]
+        else:
+            candidate_indices = list(range(len(self.known_face_ids)))
 
         print("Analyzing classroom image...")
 
         classroom_image = face_recognition.load_image_file(classroom_image_path)
         classroom_image_cv = cv2.cvtColor(classroom_image, cv2.COLOR_RGB2BGR)
 
-        # Upsample improves detection of smaller / distant faces in group photos.
-        face_locations = face_recognition.face_locations(
-            classroom_image,
-            number_of_times_to_upsample=2,
-        )
-        face_encodings = face_recognition.face_encodings(
-            classroom_image,
-            face_locations,
-            num_jitters=1,
-        )
-
-        if len(face_encodings) < len(face_locations):
-            print(
-                f"Warning: encoded {len(face_encodings)} of {len(face_locations)} detected faces"
-            )
+        face_locations = self._detect_face_locations(classroom_image)
 
         present_student_ids = []
         unknown_faces = 0
@@ -213,33 +249,34 @@ class ClassroomAttendanceSystem:
         subset_ids = [self.known_face_ids[i] for i in candidate_indices]
         subset_names = [self.known_face_names[i] for i in candidate_indices]
 
-        for face_index, face_encoding in enumerate(face_encodings):
-            if face_index >= len(face_locations):
-                break
-            top, right, bottom, left = face_locations[face_index]
+        for face_index, location in enumerate(face_locations):
+            top, right, bottom, left = location
+            face_encoding = self._encode_face_at_location(classroom_image, location)
 
             student_id = None
             name = "Unknown"
             confidence = 0.0
 
-            if subset_encodings:
-                matches = face_recognition.compare_faces(
-                    subset_encodings, face_encoding, tolerance=tolerance
-                )
+            if face_encoding is None:
+                unknown_faces += 1
+            elif subset_encodings:
                 face_distances = face_recognition.face_distance(
                     subset_encodings, face_encoding
                 )
                 best_match_index = int(np.argmin(face_distances))
-                best_confidence = 1 - face_distances[best_match_index]
-                if matches[best_match_index] and best_confidence >= min_confidence:
+                best_distance = float(face_distances[best_match_index])
+                best_confidence = 1 - best_distance
+
+                if best_distance <= tolerance:
                     student_id = subset_ids[best_match_index]
                     name = subset_names[best_match_index]
-                    confidence = float(best_confidence)
+                    confidence = best_confidence
                     if student_id not in present_student_ids:
                         present_student_ids.append(student_id)
                 else:
                     unknown_faces += 1
             else:
+                # Enrolled section has no registered face photos yet.
                 unknown_faces += 1
 
             face_details.append({
@@ -287,7 +324,7 @@ class ClassroomAttendanceSystem:
             "present_count": len(present_student_ids),
             "absent_count": len(absent_student_ids),
             "unknown_faces": unknown_faces,
-            "faces_detected": len(face_encodings),
+            "faces_detected": len(face_locations),
             "face_details": face_details,
         }
 

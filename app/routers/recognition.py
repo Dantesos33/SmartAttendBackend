@@ -75,7 +75,7 @@ async def register_student(
 async def recognize_classroom(
     file: UploadFile = File(...),
     section_id: int | None = Form(None),
-    tolerance: float = Form(0.45),
+    tolerance: float = Form(0.52),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
