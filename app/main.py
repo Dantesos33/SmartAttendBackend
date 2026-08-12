@@ -7,6 +7,9 @@ from sqlalchemy import text
 from app import models  # noqa: F401 — ensures all models are registered on Base before create_all
 from app.config import settings
 from app.routers import auth, universities, classes, enrollments, notifications, attendance, dashboard, recognition, leave, admin, reports
+from app.database import SessionLocal
+from app.recognition_engine import ClassroomAttendanceSystem
+from app.core.face_encoding_sync import sync_student_encodings
 
 app = FastAPI(title="SmartAttend Main API")
 
@@ -56,6 +59,20 @@ app.include_router(leave.router)
 app.include_router(admin.router)
 app.include_router(reports.router)
 
+
+@app.on_event("startup")
+def backfill_face_encodings_on_startup():
+    """Restore face embeddings from disk after deploy (Railway wipes local files
+    but DB avatar_url may still point to photos that were re-uploaded)."""
+    db = SessionLocal()
+    try:
+        synced = sync_student_encodings(db, ClassroomAttendanceSystem())
+        if synced:
+            print(f"Startup: synced {synced} student face embedding(s) from profile photos.")
+    except Exception as exc:
+        print(f"Startup face-encoding sync skipped: {exc}")
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
