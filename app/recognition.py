@@ -181,7 +181,7 @@ def check_faces_stage(
         top, right, bottom, left = loc
         encoding = None
         try:
-            encs = face_recognition.face_encodings(rgb, known_face_locations=[loc], num_jitters=1)
+            encs = face_recognition.face_encodings(rgb, known_face_locations=[loc], num_jitters=2)
             if encs:
                 encoding = [float(x) for x in encs[0]]
         except Exception as exc:
@@ -192,7 +192,13 @@ def check_faces_stage(
         status = attendance_system.classify_face_occlusion(
             rgb, loc, encoding_available=encoding is not None
         )
-        crop = attendance_system._encode_rgb_crop_base64(rgb, top, right, bottom, left, quality=96, padded=True)
+        try:
+            crop = attendance_system._encode_rgb_crop_base64(
+                rgb, top, right, bottom, left, quality=96, padded=True
+            )
+        except Exception as exc:
+            print(f"Face crop generation failed for face {i}: {exc}")
+            crop = None
         results.append({
             "face_index": i, "face_status": status,
             "location": {"top": top, "right": right, "bottom": bottom, "left": left},
@@ -206,7 +212,7 @@ def check_faces_stage(
 @router.post("/recognize/check-enrollment")
 def check_enrollment_stage(
     job_id: str = Form(...),
-    tolerance: float = Form(0.58),
+    tolerance: float = Form(0.62),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
@@ -231,7 +237,7 @@ def check_enrollment_stage(
         clear_encodings,
         tolerance=float(tolerance),
         allowed_set=allowed_set,
-        min_confidence=0.42,
+        min_confidence=0.36,
     )
 
     present_ids = []

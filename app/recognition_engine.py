@@ -659,63 +659,104 @@ class ClassroomAttendanceSystem:
         allowed_set: set | None,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> dict[int, tuple[int | None, str, float]]:
-        # Build one candidate per (face, student), using the best distance if
-        # the database contains multiple encodings for the same student.
-        student_best = {}
+        """Assign clear detected faces to enrolled students without duplicates.
+
+        Recognition is intentionally independent from Stage-1 detection.  This
+        matcher is tuned for classroom photos where an enrolled student's face
+        can be farther from the profile-photo embedding because of distance,
+        pose, lighting, or expression.  We therefore use a two-tier acceptance
+        rule instead of a single overly-strict threshold:
+
+        * strong matches are accepted directly;
+        * weaker matches are accepted only when they have a clear margin over
+          the next-best student for that face.
+
+        Assignment is global and one-to-one so the same student cannot be marked
+        present for multiple detected faces.
+        """
+        if not face_encodings_by_index or not self.known_face_encodings:
+            return {i: (None, "Unknown", 0.0) for i in face_encodings_by_index}
+
+        # Build one best distance per (face, student).  The database loader has
+        # already collapsed duplicate rows for a student.
+        candidates_by_face: dict[int, list[tuple[float, int, str, float]]] = {}
         for face_index, encoding in face_encodings_by_index.items():
-            if encoding is None or not self.known_face_encodings:
+            if encoding is None:
+                candidates_by_face[face_index] = []
                 continue
-            distances = face_recognition.face_distance(self.known_face_encodings, encoding)
-            per_student = {}
+
+            try:
+                distances = face_recognition.face_distance(
+                    self.known_face_encodings, encoding
+                )
+            except Exception as exc:
+                print(f"Face-distance calculation failed for face {face_index}: {exc}")
+                candidates_by_face[face_index] = []
+                continue
+
+            options = []
             for idx, raw_distance in enumerate(distances):
                 sid = int(self.known_face_ids[idx])
                 if allowed_set is not None and sid not in allowed_set:
                     continue
                 distance = float(raw_distance)
-                if distance < per_student.get(sid, float("inf")):
-                    per_student[sid] = distance
-            for sid, distance in per_student.items():
-                if distance > tolerance:
-                    continue
                 confidence = max(0.0, 1.0 - distance)
-                if confidence < min_confidence:
-                    continue
-                idx = self.known_face_ids.index(sid)
-                student_best[(face_index, sid)] = (distance, self.known_face_names[idx], confidence)
 
-        # A loose match is dangerous in classroom photos. Require the best
-        # student to be meaningfully better than the next-best candidate for
-        # that face when there is ambiguity.
+                # Hard ceiling.  Never allow a genuinely distant embedding to
+                # become a classroom match merely because the student is still
+                # unused.
+                if distance > max(float(tolerance), 0.64):
+                    continue
+                options.append(
+                    (distance, sid, self.known_face_names[idx], confidence)
+                )
+
+            options.sort(key=lambda item: item[0])
+            candidates_by_face[face_index] = options
+
+        # Convert each face's candidate list into an acceptance candidate.  A
+        # relaxed match is allowed for difficult classroom faces only when the
+        # best student is clearly separated from the second-best student.
         candidates = []
-        for face_index in face_encodings_by_index:
-            options = [
-                (dist, sid, name, conf)
-                for (fi, sid), (dist, name, conf) in student_best.items()
-                if fi == face_index
-            ]
-            options.sort(key=lambda x: x[0])
+        for face_index, options in candidates_by_face.items():
             if not options:
                 continue
-            best = options[0]
-            if len(options) > 1:
-                margin = options[1][0] - best[0]
-                # Only reject ambiguous matches; don't penalize a strong close
-                # match simply because another student is somewhat nearby.
-                if best[0] > 0.48 and margin < 0.055:
-                    continue
-            dist, sid, name, conf = best
-            candidates.append((dist, face_index, sid, name, conf))
 
-        # Global one-to-one assignment: each face and each student can be used
-        # at most once.
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        assignments = {}
+            best = options[0]
+            best_distance, sid, name, confidence = best
+            second_distance = options[1][0] if len(options) > 1 else float("inf")
+            margin = second_distance - best_distance
+
+            strong_limit = min(float(tolerance), 0.58)
+            relaxed_limit = max(float(tolerance), 0.62)
+
+            accepted = False
+            if best_distance <= strong_limit and confidence >= 0.40:
+                accepted = True
+            elif (
+                best_distance <= relaxed_limit
+                and confidence >= max(0.36, float(min_confidence))
+                and margin >= 0.075
+            ):
+                accepted = True
+
+            if accepted:
+                candidates.append(
+                    (best_distance, face_index, sid, name, confidence)
+                )
+
+        # Global one-to-one assignment.  Stronger matches are always considered
+        # before relaxed matches.  This prevents two classroom faces from being
+        # given the same enrolled student's name.
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        assignments: dict[int, tuple[int | None, str, float]] = {}
         assigned_faces = set()
         assigned_students = set()
-        for dist, face_index, sid, name, conf in candidates:
+
+        for distance, face_index, sid, name, confidence in candidates:
             if face_index in assigned_faces or sid in assigned_students:
                 continue
-            assignments[face_index] = (sid, name, conf)
+            assignments[face_index] = (sid, name, confidence)
             assigned_faces.add(face_index)
             assigned_students.add(sid)
 
