@@ -146,7 +146,7 @@ def save_attendance_session(
     return session_row
 
 
-@router.get("/sessions/section/{section_id}/today", response_model=AttendanceSessionOut)
+@router.get("/sessions/section/{section_id}/today", response_model=AttendanceSessionOut | None)
 def get_today_session(
     section_id: int,
     db: Session = Depends(get_db),
@@ -164,8 +164,9 @@ def get_today_session(
         .filter(AttendanceSession.section_id == section_id, AttendanceSession.date == date.today())
         .first()
     )
-    if not session:
-        raise HTTPException(status_code=404, detail="No attendance recorded for this section today.")
+    # No attendance today is a normal state, not an API error. Returning null
+    # lets the Take Attendance screen render immediately without showing a
+    # loading/error state just because the teacher has not taken attendance yet.
     return session
 
 
