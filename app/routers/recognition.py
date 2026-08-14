@@ -237,7 +237,7 @@ def check_enrollment_stage(
         clear_encodings,
         tolerance=float(tolerance),
         allowed_set=allowed_set,
-        min_confidence=0.40,
+        min_confidence=0.50,
     )
 
     present_ids = []

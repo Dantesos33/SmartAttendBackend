@@ -9,7 +9,7 @@ import json
 import urllib.request
 import threading
 
-MIN_CONFIDENCE = 0.40
+MIN_CONFIDENCE = 0.50
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
@@ -336,7 +336,7 @@ class ClassroomAttendanceSystem:
             # Upscale only this small crop; this does not affect Stage-1 detection.
             landmark_crop = crop
             if max(ch, cw) < 180:
-                scale = min(4.0, 180.0 / max(ch, cw))
+                scale = min(6.0, 256.0 / max(ch, cw))
                 landmark_crop = cv2.resize(
                     crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
                 )
@@ -356,15 +356,14 @@ class ClassroomAttendanceSystem:
             # Score independent signals instead of relying on one brittle rule.
             score = 0
 
-            # Eyes visible while the mouth landmark disappears is the strongest
-            # generic mask/face-covering cue available here.  Do not require the
-            # nose landmark to disappear: ordinary surgical masks often leave
-            # enough of the nose visible for the landmark model to find it.
+            # Eyes visible while the mouth is absent is the strongest practical
+            # classroom cue for a surgical mask/niqab. Give this enough weight
+            # to survive small/low-resolution face crops.
             if eyes and not mouth:
-                score += 2
+                score += 3
 
-            # A completely covered lower face (mask/niqab) is an even stronger
-            # signal when both mouth and nose landmarks disappear.
+            # If eyes are visible but both mouth and nose structure are absent,
+            # this is particularly useful for niqab/face-covering cases.
             if eyes and not mouth and not nose:
                 score += 2
 
@@ -393,13 +392,14 @@ class ClassroomAttendanceSystem:
             if eyes and lower_edges < max(upper_edges * 0.82, 0.018):
                 score += 1
 
-            # For a visible pair of eyes with no mouth landmark, require one
-            # additional lower-face cue.  This catches masks whose nose landmark
-            # is still visible while avoiding classifying every small/sideways
-            # face as masked.  A full lower-face covering is accepted directly.
-            strong_full_cover = eyes and not mouth and not nose
-            partial_cover = eyes and not mouth and (texture_flat or dark_cover or lower_edges < max(upper_edges * 0.82, 0.018))
-            if strong_full_cover or partial_cover or score >= 3:
+            # A visible eye pair with a missing mouth and substantially reduced
+            # lower-face detail is especially reliable for masks/niqab.
+            if eyes and not mouth and lower_std < max(upper_std * 0.92, 12.0):
+                score += 1
+
+            # Require strong evidence.  This reduces false positives on sideways,
+            # downward-facing and low-resolution clear faces.
+            if score >= 3:
                 return "masked"
             return "clear"
         except Exception:
@@ -670,7 +670,7 @@ class ClassroomAttendanceSystem:
         face_encodings_by_index: dict[int, np.ndarray | None],
         tolerance: float,
         allowed_set: set | None,
-        min_confidence: float = 0.40,
+        min_confidence: float = MIN_CONFIDENCE,
     ) -> dict[int, tuple[int | None, str, float]]:
         """Assign clear detected faces to enrolled students without duplicates.
 
@@ -744,11 +744,15 @@ class ClassroomAttendanceSystem:
             relaxed_limit = max(float(tolerance), 0.62)
 
             accepted = False
-            if best_distance <= strong_limit and confidence >= 0.40:
+            # Never accept a match below the configured 50% confidence floor.
+            # This is intentionally checked independently of the distance tiers.
+            if confidence < 0.50 or confidence < float(min_confidence):
+                accepted = False
+            elif best_distance <= strong_limit and confidence >= 0.50:
                 accepted = True
             elif (
                 best_distance <= relaxed_limit
-                and confidence >= max(0.40, float(min_confidence))
+                and confidence >= 0.50
                 and margin >= 0.075
             ):
                 accepted = True
