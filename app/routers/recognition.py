@@ -148,7 +148,12 @@ async def detect_faces_stage(
         shutil.copyfileobj(file.file, buffer)
     try:
         image = face_recognition.load_image_file(image_path)
-        locations = attendance_system._detect_face_locations(image)
+        # Stage 1 detector is completely unchanged. Only after it returns all
+        # candidates do we remove boxes with no visible eye region.
+        detected_locations = attendance_system._detect_face_locations(image)
+        locations = attendance_system.filter_locations_without_visible_eyes(
+            image, detected_locations
+        )
         faces = [
             {"face_index": i, "location": {"top": int(t), "right": int(r), "bottom": int(b), "left": int(l)}}
             for i, (t, r, b, l) in enumerate(locations)

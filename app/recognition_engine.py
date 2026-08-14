@@ -9,7 +9,7 @@ import json
 import urllib.request
 import threading
 
-MIN_CONFIDENCE = 0.50
+MIN_CONFIDENCE = 0.45
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
@@ -295,6 +295,73 @@ class ClassroomAttendanceSystem:
             return []
 
 
+    def _has_visible_eye_region(self, rgb_image, location):
+        """Return True when an already-detected face has visible eye landmarks.
+
+        This is a post-detection quality gate only. It deliberately does not
+        modify YuNet/HOG/tile/rotation detection or its thresholds. At least
+        one geometrically valid eye is enough so profile/side-facing faces
+        are not discarded merely because one eye is outside the visible face.
+        """
+        try:
+            top, right, bottom, left = [int(x) for x in location]
+            h, w = rgb_image.shape[:2]
+            top, left = max(0, top), max(0, left)
+            bottom, right = min(h, bottom), min(w, right)
+            if bottom <= top or right <= left:
+                return False
+
+            crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
+            ch, cw = crop.shape[:2]
+            if ch < 20 or cw < 16:
+                return False
+
+            landmark_crop = crop
+            if max(ch, cw) < 180:
+                scale = min(4.0, 180.0 / max(ch, cw))
+                landmark_crop = cv2.resize(
+                    crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+                )
+
+            landmarks = face_recognition.face_landmarks(landmark_crop, model="large")
+            if not landmarks:
+                return False
+
+            face = landmarks[0]
+            eye_sets = [face.get("left_eye") or [], face.get("right_eye") or []]
+            visible_eyes = 0
+            for points in eye_sets:
+                if len(points) < 4:
+                    continue
+                pts = np.asarray(points, dtype=np.float32)
+                width = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
+                height = float(np.max(pts[:, 1]) - np.min(pts[:, 1]))
+                # Reject degenerate landmark noise while keeping small classroom eyes.
+                if width >= 1.5 and height >= 0.8:
+                    visible_eyes += 1
+
+            return visible_eyes >= 1
+        except Exception:
+            return False
+
+    def filter_locations_without_visible_eyes(self, rgb_image, locations):
+        """Filter detected boxes only after the protected detector has finished.
+
+        The detector itself is untouched. Boxes with no visible eye region are
+        removed before the user-facing face count and before mask classification.
+        """
+        kept = []
+        removed = 0
+        for location in locations:
+            if self._has_visible_eye_region(rgb_image, location):
+                kept.append(tuple(location))
+            else:
+                removed += 1
+        if removed:
+            print(f"Ignored {removed} detected face candidate(s) without visible eyes.")
+        print(f"Detected {len(kept)} face(s) after eye-visibility filtering.")
+        return kept
+
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
         """Stage-2 mask/occlusion classification only.
 
@@ -336,7 +403,7 @@ class ClassroomAttendanceSystem:
             # Upscale only this small crop; this does not affect Stage-1 detection.
             landmark_crop = crop
             if max(ch, cw) < 180:
-                scale = min(6.0, 256.0 / max(ch, cw))
+                scale = min(4.0, 180.0 / max(ch, cw))
                 landmark_crop = cv2.resize(
                     crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
                 )
@@ -356,11 +423,9 @@ class ClassroomAttendanceSystem:
             # Score independent signals instead of relying on one brittle rule.
             score = 0
 
-            # Eyes visible while the mouth is absent is the strongest practical
-            # classroom cue for a surgical mask/niqab. Give this enough weight
-            # to survive small/low-resolution face crops.
+            # Eyes visible but mouth structure missing is a strong occlusion cue.
             if eyes and not mouth:
-                score += 3
+                score += 2
 
             # If eyes are visible but both mouth and nose structure are absent,
             # this is particularly useful for niqab/face-covering cases.
@@ -390,11 +455,6 @@ class ClassroomAttendanceSystem:
             # Very low lower-face detail combined with visible eyes is useful for
             # masks/niqabs even when the landmark detector only finds the eyes.
             if eyes and lower_edges < max(upper_edges * 0.82, 0.018):
-                score += 1
-
-            # A visible eye pair with a missing mouth and substantially reduced
-            # lower-face detail is especially reliable for masks/niqab.
-            if eyes and not mouth and lower_std < max(upper_std * 0.92, 12.0):
                 score += 1
 
             # Require strong evidence.  This reduces false positives on sideways,
@@ -744,15 +804,11 @@ class ClassroomAttendanceSystem:
             relaxed_limit = max(float(tolerance), 0.62)
 
             accepted = False
-            # Never accept a match below the configured 50% confidence floor.
-            # This is intentionally checked independently of the distance tiers.
-            if confidence < 0.50 or confidence < float(min_confidence):
-                accepted = False
-            elif best_distance <= strong_limit and confidence >= 0.50:
+            if best_distance <= strong_limit and confidence >= 0.40:
                 accepted = True
             elif (
                 best_distance <= relaxed_limit
-                and confidence >= 0.50
+                and confidence >= max(0.36, float(min_confidence))
                 and margin >= 0.075
             ):
                 accepted = True
