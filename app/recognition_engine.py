@@ -296,90 +296,98 @@ class ClassroomAttendanceSystem:
 
 
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
-        """Stage-2 occlusion classifier.
+        """Conservative Stage-2 mask/occlusion classifier.
 
-        Detection is identity-independent. A clear face that successfully
-        produces a face embedding must NOT be labelled masked merely because
-        a mouth/smile detector failed (which was causing every face in group
-        photos to become masked). Visual occlusion evidence is therefore only
-        used when encoding is unavailable, and it must be strong before a face
-        is classified as masked. Otherwise the face remains clear/unrecognized.
+        IMPORTANT: this function does not perform detection. Stage-1 locations are
+        passed in unchanged. Recognition availability must also not automatically
+        make a face "clear": masked students can still produce an embedding.
+
+        A face is marked masked only when there is actual lower-face occlusion
+        evidence. Ordinary profile/downward/low-resolution faces remain clear and
+        can continue to enrollment matching.
         """
         top, right, bottom, left = [int(x) for x in location]
         h, w = rgb_image.shape[:2]
-        top=max(0,top); left=max(0,left); bottom=min(h,bottom); right=min(w,right)
+        top = max(0, top); left = max(0, left)
+        bottom = min(h, bottom); right = min(w, right)
         if bottom <= top or right <= left:
             return "clear"
 
-        crop = rgb_image[top:bottom, left:right]
+        crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
         ch, cw = crop.shape[:2]
-        if ch < 32 or cw < 24:
-            return "clear"
-
-        # A valid embedding is strong evidence that the face is sufficiently
-        # visible for recognition. Do not turn normal unmasked faces into
-        # masked merely because legacy Haar mouth detection is unavailable.
-        if encoding_available:
+        if ch < 48 or cw < 32:
+            # Tiny faces are intentionally never classified as masked from weak
+            # image statistics. They remain clear/unrecognized.
             return "clear"
 
         try:
             gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-            upper = gray[int(ch * 0.15):int(ch * 0.52), :]
-            lower = gray[int(ch * 0.50):int(ch * 0.92), :]
+            # Focus on the facial area; ignore the very top hair/background and
+            # the bottom shirt/background region.
+            upper = gray[int(ch * 0.16):int(ch * 0.50), int(cw * 0.10):int(cw * 0.90)]
+            lower = gray[int(ch * 0.50):int(ch * 0.88), int(cw * 0.10):int(cw * 0.90)]
             if upper.size == 0 or lower.size == 0:
                 return "clear"
 
-            # Look for strong lower-face occlusion. These are deliberately
-            # conservative signals: failed recognition alone is NOT enough to
-            # call a face masked, otherwise sideways/downward clear faces would
-            # all become masked.
             upper_mean = float(np.mean(upper))
             lower_mean = float(np.mean(lower))
             upper_std = float(np.std(upper))
             lower_std = float(np.std(lower))
 
-            # Legacy Haar is optional. If present, use it only as supporting
-            # evidence, never as the sole reason to classify a face as masked.
-            eyes = 0
-            smiles = 0
-            cascade_cls = getattr(cv2, "CascadeClassifier", None)
-            haar_root = getattr(getattr(cv2, "data", None), "haarcascades", None)
-            if cascade_cls is not None and haar_root:
-                try:
-                    eye_path = os.path.join(haar_root, "haarcascade_eye_tree_eyeglasses.xml")
-                    smile_path = os.path.join(haar_root, "haarcascade_smile.xml")
-                    if os.path.exists(eye_path):
-                        eye = cascade_cls(eye_path)
-                        if not eye.empty():
-                            detections = eye.detectMultiScale(
-                                gray, 1.08, 5,
-                                minSize=(max(6, cw // 10), max(6, ch // 10)),
-                            )
-                            eyes = len(detections)
-                    if os.path.exists(smile_path):
-                        smile = cascade_cls(smile_path)
-                        if not smile.empty():
-                            lower_region = gray[int(ch * 0.48):, :]
-                            detections = smile.detectMultiScale(
-                                lower_region, 1.7, 25,
-                                minSize=(max(8, cw // 7), max(5, ch // 12)),
-                            )
-                            smiles = len(detections)
-                except Exception:
-                    pass
+            # Edge density is useful because fabric masks/niqabs tend to make the
+            # lower face relatively uniform while a visible mouth/chin has more
+            # local structure. This is only a supporting signal.
+            upper_edges = cv2.Canny(upper, 60, 140)
+            lower_edges = cv2.Canny(lower, 60, 140)
+            upper_edge_density = float(np.mean(upper_edges > 0))
+            lower_edge_density = float(np.mean(lower_edges > 0))
 
-            dark_flat_lower = (
-                upper_mean > 40 and
-                lower_mean < upper_mean * 0.62 and
-                lower_std < max(upper_std * 0.82, 8.0)
+            landmarks = {}
+            try:
+                lm = face_recognition.face_landmarks(crop, model="large")
+                if lm:
+                    landmarks = lm[0]
+            except Exception:
+                landmarks = {}
+
+            has_both_eyes = bool(landmarks.get("left_eye")) and bool(landmarks.get("right_eye"))
+            has_mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
+            has_nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
+
+            # Strong mask/niqab signal:
+            # - eyes are visible, while mouth is absent, AND
+            # - lower face is unusually uniform OR substantially less detailed.
+            eye_only_occlusion = (
+                has_both_eyes and
+                not has_mouth and
+                (lower_std < max(upper_std * 0.78, 10.0) or
+                 lower_edge_density < max(upper_edge_density * 0.58, 0.018))
             )
-            eye_pair_without_lower_detail = eyes >= 2 and smiles == 0 and lower_std < max(upper_std * 0.75, 9.0)
 
-            if dark_flat_lower or eye_pair_without_lower_detail:
+            # Strong fabric/occlusion signal even if landmarks are incomplete.
+            # Requiring both intensity and texture differences avoids classifying
+            # ordinary shadows, sideways faces, or low-resolution faces as masks.
+            dark_flat_lower = (
+                upper_mean > 45 and
+                lower_mean < upper_mean * 0.68 and
+                lower_std < max(upper_std * 0.72, 10.0) and
+                lower_edge_density < max(upper_edge_density * 0.62, 0.020)
+            )
+
+            # A niqab can cover most of the lower face without being particularly
+            # dark. In that case the reliable signal is visible eyes + missing
+            # mouth/nose structure + low lower-face detail.
+            niqab_like = (
+                has_both_eyes and
+                not has_mouth and
+                not has_nose and
+                lower_std < max(upper_std * 0.88, 12.0) and
+                lower_edge_density < max(upper_edge_density * 0.72, 0.022)
+            )
+
+            if eye_only_occlusion or dark_flat_lower or niqab_like:
                 return "masked"
 
-            # No strong visual evidence: keep the face clear so enrollment
-            # matching can decide whether it is an unrecognized student.
             return "clear"
         except Exception:
             return "clear"

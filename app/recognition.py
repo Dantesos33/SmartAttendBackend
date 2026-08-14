@@ -206,7 +206,7 @@ def check_faces_stage(
 @router.post("/recognize/check-enrollment")
 def check_enrollment_stage(
     job_id: str = Form(...),
-    tolerance: float = Form(0.55),
+    tolerance: float = Form(0.58),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
@@ -231,7 +231,7 @@ def check_enrollment_stage(
         clear_encodings,
         tolerance=float(tolerance),
         allowed_set=allowed_set,
-        min_confidence=0.50,
+        min_confidence=0.42,
     )
 
     present_ids = []
