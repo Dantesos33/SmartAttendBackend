@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
@@ -22,6 +23,17 @@ from app.core.deps import get_current_user, require_role
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 _RESET_MISMATCH = "No account matches these details."
+
+
+def _avatar_url_for(user_id: int) -> str:
+    """Every re-upload overwrites the same known_students/{id}.jpg file, so
+    the URL itself never changes from one photo to the next. Clients (RN's
+    Image component, browsers, any CDN in front of /media) cache images by
+    URL, so an unchanged URL means a stale cached photo keeps being shown
+    everywhere even though the file on disk was replaced. Appending a
+    cache-busting version (current timestamp) makes each upload look like a
+    new resource, forcing every screen to fetch the fresh image."""
+    return f"/media/known_students/{user_id}.jpg?v={int(time.time())}"
 
 
 def _find_user_for_password_reset(
@@ -209,11 +221,11 @@ async def upload_profile_photo(
             if encoding is not None:
                 current_user.face_encoding_json = attendance_system._encoding_to_json(encoding)
 
-            current_user.avatar_url = f"/media/known_students/{current_user.id}.jpg"
+            current_user.avatar_url = _avatar_url_for(current_user.id)
         else:
             dest_path = f"known_students/{current_user.id}.jpg"
             shutil.copyfile(temp_path, dest_path)
-            current_user.avatar_url = f"/media/known_students/{current_user.id}.jpg"
+            current_user.avatar_url = _avatar_url_for(current_user.id)
 
         db.commit()
         db.refresh(current_user)
@@ -221,4 +233,3 @@ async def upload_profile_photo(
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-

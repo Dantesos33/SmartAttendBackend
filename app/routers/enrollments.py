@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 import os
 import shutil
+import time
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -503,7 +504,11 @@ async def teacher_add_student_with_photo(
         if encoding is not None:
             student.face_encoding_json = attendance_system._encoding_to_json(encoding)
 
-        student.avatar_url = f"/media/known_students/{student.id}.jpg"
+        # Cache-bust: without a version query param, re-adding/re-photographing
+        # a student later would produce the exact same URL as before, and
+        # clients would keep showing whatever image they'd already cached
+        # for that URL instead of the new file on disk.
+        student.avatar_url = f"/media/known_students/{student.id}.jpg?v={int(time.time())}"
 
         enrollment = Enrollment(
             student_id=student.id,

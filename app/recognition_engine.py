@@ -9,7 +9,9 @@ import json
 
 MIN_CONFIDENCE = 0.48
 MAX_DETECT_EDGE = 1280
+MAX_DETECT_EDGE_LARGE = 1920
 MAX_ANNOTATED_EDGE = 1200
+LARGE_IMAGE_PIXELS = 2_000_000
 
 class ClassroomAttendanceSystem:
     """
@@ -318,60 +320,104 @@ class ClassroomAttendanceSystem:
             name = self.metadata.get(str(student_id), {}).get("name", f"Student {student_id}")
             self._register_encoding(filepath, student_id, name)
 
+    def _filter_face_locations(self, locations, img_h, img_w):
+        """Drop out-of-bounds boxes, padding artefacts, and non-face-sized regions."""
+        img_area = img_h * img_w
+        min_h = max(16, int(img_h * 0.012))
+        min_area = min_h * min_h * 0.45
+        max_area = img_area * 0.2
+        filtered = []
+        for top, right, bottom, left in locations:
+            top = int(top)
+            right = int(right)
+            bottom = int(bottom)
+            left = int(left)
+            if top < 0 or left < 0 or bottom > img_h or right > img_w:
+                continue
+            if bottom <= top or right <= left:
+                continue
+            height = bottom - top
+            width = right - left
+            if height < min_h or width < max(12, int(min_h * 0.55)):
+                continue
+            area = height * width
+            if area < min_area or area > max_area:
+                continue
+            aspect = width / height
+            if aspect < 0.45 or aspect > 2.2:
+                continue
+            filtered.append((top, right, bottom, left))
+        return filtered
+
+    def _choose_detect_edge(self, rgb_image):
+        h, w = rgb_image.shape[:2]
+        if h * w >= LARGE_IMAGE_PIXELS:
+            return MAX_DETECT_EDGE_LARGE
+        return MAX_DETECT_EDGE
+
     def _detect_face_locations(self, rgb_image):
-        """Memory-safe detection: downscale first, add extra passes only if needed."""
-        detect_img, det_scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
-        inv_scale = 1.0 / det_scale
-        collected = []
+        """Memory-safe detection with adaptive resolution for large group photos."""
+        h, w = rgb_image.shape[:2]
+        detect_edge = self._choose_detect_edge(rgb_image)
+        collected: list = []
 
-        def add_pass(img, offset_y=0, offset_x=0, upsample=1):
-            batch = face_recognition.face_locations(
-                img,
-                number_of_times_to_upsample=upsample,
-            )
-            if offset_y or offset_x:
-                batch = self._offset_locations(batch, offset_y, offset_x)
-            collected.extend(self._scale_locations(batch, inv_scale))
+        for edge in dict.fromkeys((detect_edge, MAX_DETECT_EDGE_LARGE)):
+            detect_img, det_scale = self._downscale_rgb(rgb_image, edge)
+            inv_scale = 1.0 / det_scale
 
-        add_pass(detect_img, upsample=1)
-        merged = self._merge_face_locations(collected)
+            for upsample in (1, 2):
+                batch = face_recognition.face_locations(
+                    detect_img,
+                    number_of_times_to_upsample=upsample,
+                )
+                collected.extend(self._scale_locations(batch, inv_scale))
+                merged = self._filter_face_locations(
+                    self._merge_face_locations(collected), h, w
+                )
+                if len(merged) >= 4:
+                    del detect_img
+                    gc.collect()
+                    print(f"Detected {len(merged)} face(s) at edge={edge}, upsample={upsample}.")
+                    return merged
 
-        if len(merged) < 4:
-            h, w = detect_img.shape[:2]
-            pad = max(12, int(min(h, w) * 0.05))
-            padded = cv2.copyMakeBorder(
-                detect_img, pad, pad, pad, pad, cv2.BORDER_REPLICATE
-            )
-            add_pass(padded, offset_y=pad, offset_x=pad, upsample=1)
-            del padded
-            merged = self._merge_face_locations(collected)
+            del detect_img
 
-        if len(merged) < 4:
-            add_pass(detect_img, upsample=2)
-            merged = self._merge_face_locations(collected)
-
-        del detect_img
+        merged = self._filter_face_locations(self._merge_face_locations(collected), h, w)
         gc.collect()
-        print(f"Detected {len(merged)} face(s) after memory-safe detection.")
+        print(f"Detected {len(merged)} face(s) after filtered multi-pass detection.")
         return merged
 
     def _encode_face_at_location(self, rgb_image, location):
-        work_image, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
-        if scale != 1.0:
-            top, right, bottom, left = location
-            location = (
-                int(top * scale),
-                int(right * scale),
-                int(bottom * scale),
-                int(left * scale),
-            )
+        top, right, bottom, left = location
+        top = max(0, int(top))
+        left = max(0, int(left))
+        bottom = min(rgb_image.shape[0], int(bottom))
+        right = min(rgb_image.shape[1], int(right))
+        location = (top, right, bottom, left)
+
         encodings = face_recognition.face_encodings(
-            work_image,
+            rgb_image,
             [location],
             num_jitters=1,
         )
         if encodings:
             return encodings[0]
+
+        work_image, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE_LARGE)
+        if scale != 1.0:
+            scaled_location = (
+                int(top * scale),
+                int(right * scale),
+                int(bottom * scale),
+                int(left * scale),
+            )
+            encodings = face_recognition.face_encodings(
+                work_image,
+                [scaled_location],
+                num_jitters=1,
+            )
+            if encodings:
+                return encodings[0]
         return None
 
     def _assign_faces_to_students(
