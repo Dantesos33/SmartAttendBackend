@@ -170,15 +170,37 @@ def check_faces_stage(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
-    """Stage 2: classify detected faces as masked/clear and prepare clear-face embeddings."""
+    """Stage 2: classify detected faces as masked/clear and prepare clear-face embeddings.
+
+    Detection itself (Stage 1) is untouched here — this stage only interprets
+    the boxes it already received. Every candidate is passed through
+    ``classify_face_visibility``:
+      * "insufficient" (no meaningful upper-face evidence — e.g. only a lower
+        face fragment, cheek, ear, or the back/side of a head) is dropped
+        entirely and does not appear in the results or the total face count.
+      * "masked" (upper face visible, lower face covered) is kept and always
+        reported as unrecognized further down the pipeline.
+      * "clear" is kept and proceeds to normal recognition.
+    """
     job = _load_job(job_id)
     section = _validate_section(db, job["section_id"], current_user)
     image = face_recognition.load_image_file(job["image_path"])
     rgb = np.ascontiguousarray(image)
     face_locations = [tuple(x) for x in job["face_locations"]]
     results = []
+    dropped_insufficient = 0
     for i, loc in enumerate(face_locations):
         top, right, bottom, left = loc
+
+        # Visibility/occlusion is decided from the image region alone, before
+        # encoding is attempted, so a face with no meaningful upper-face
+        # evidence is removed from the count regardless of whether it could
+        # be encoded.
+        visibility = attendance_system.classify_face_visibility(rgb, loc)
+        if visibility == "insufficient":
+            dropped_insufficient += 1
+            continue
+
         encoding = None
         try:
             encs = face_recognition.face_encodings(rgb, known_face_locations=[loc], num_jitters=2)
@@ -189,9 +211,7 @@ def check_faces_stage(
 
         # Detection is already complete. A face that cannot be encoded is kept
         # as masked/occluded rather than being dropped from attendance.
-        status = attendance_system.classify_face_occlusion(
-            rgb, loc, encoding_available=encoding is not None
-        )
+        status = visibility  # "clear" or "masked"
         try:
             crop = attendance_system._encode_rgb_crop_base64(
                 rgb, top, right, bottom, left, quality=96, padded=True
@@ -205,9 +225,17 @@ def check_faces_stage(
             "encoding": encoding, "crop_base64": crop,
         })
     job["faces"] = results
+    job["dropped_insufficient_faces"] = dropped_insufficient
     job["stage"] = "faces_checked"
     _save_job(job_id, job)
-    return {"status": "success", "job_id": job_id, "stage": "checking_faces", "data": {"faces": [{k:v for k,v in f.items() if k != "encoding"} for f in results]}}
+    return {
+        "status": "success", "job_id": job_id, "stage": "checking_faces",
+        "data": {
+            "faces": [{k: v for k, v in f.items() if k != "encoding"} for f in results],
+            "faces_detected": len(results),
+            "dropped_insufficient_faces": dropped_insufficient,
+        },
+    }
 
 @router.post("/recognize/check-enrollment")
 def check_enrollment_stage(
@@ -237,7 +265,7 @@ def check_enrollment_stage(
         clear_encodings,
         tolerance=float(tolerance),
         allowed_set=allowed_set,
-        min_confidence=0.36,
+        min_confidence=0.50,
     )
 
     present_ids = []
@@ -285,7 +313,8 @@ def check_enrollment_stage(
     result = {
         "section_id": section.id, "faces_detected": len(final_faces), "present_student_ids": present_ids,
         "absent_student_ids": absent_ids, "present_count": len(present_ids), "absent_count": len(absent_ids),
-        "masked_count": 0,
+        "masked_count": sum(1 for f in final_faces if f["face_status"] == "masked"),
+        "dropped_insufficient_faces": job.get("dropped_insufficient_faces", 0),
         "unknown_faces": sum(1 for f in final_faces if f["attendance_status"] == "unrecognized"),
         "face_details": final_faces, "annotated_image_base64": annotated_b64,
         "enrolled_with_face_photos": len(attendance_system.known_face_ids), "recognition_available": bool(attendance_system.known_face_encodings),

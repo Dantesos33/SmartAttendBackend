@@ -9,7 +9,7 @@ import json
 import urllib.request
 import threading
 
-MIN_CONFIDENCE = 0.45
+MIN_CONFIDENCE = 0.50
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
@@ -295,16 +295,32 @@ class ClassroomAttendanceSystem:
             return []
 
 
-    def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
-        """Stage-2 mask/occlusion classification only.
+    def classify_face_visibility(self, rgb_image, location, encoding_available=False):
+        """Stage-2 visibility + occlusion classification.
 
-        Detection is intentionally NOT performed here.  The detector has a
-        protected baseline and this method only decides whether an already
-        detected face has strong evidence of lower-face covering.
+        Detection is intentionally NOT performed here.  The detector (Stage 1,
+        ``_detect_face_locations``) has a protected baseline and is never
+        touched by this method — it only interprets an already detected box.
+
+        Returns one of:
+          * ``"clear"``        - a normal, sufficiently visible face. Proceeds
+            to recognition as usual.
+          * ``"masked"``       - the upper face (eyes/forehead/eyebrows) is
+            visible but the lower face is covered (mask, niqab, hand, etc.).
+            These faces are kept in the results but are always treated as
+            unrecognized for attendance — they are never matched to an
+            identity, because eyes-only evidence is not reliable enough.
+          * ``"insufficient"`` - there is no meaningful upper-face evidence at
+            all (e.g. only a lower-face fragment, cheek, ear, or the back/side
+            of a head is visible). These detections carry too little face
+            information to be a usable attendance record and are dropped
+            entirely — they are removed from the results and from the total
+            detected-face count.
 
         The classifier uses several independent cues and a small landmark
-        upscale pass.  This is deliberately conservative: one weak cue must
-        never turn a normal face into ``masked``.
+        upscale pass. It is deliberately conservative: weak/ambiguous evidence
+        always resolves to "clear" so normal profile, downward-facing, and
+        small classroom faces are never wrongly dropped or blanket-masked.
         """
         top, right, bottom, left = [int(x) for x in location]
         h, w = rgb_image.shape[:2]
@@ -352,7 +368,22 @@ class ClassroomAttendanceSystem:
             eyes = bool(landmarks.get("left_eye")) and bool(landmarks.get("right_eye"))
             mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
             nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
+            brow = bool(landmarks.get("left_eyebrow")) or bool(landmarks.get("right_eyebrow"))
 
+            # --- Gate: is there any meaningful upper-face (eyes/forehead)
+            # evidence at all? Strong evidence is an eye or eyebrow landmark.
+            # When landmarks fail (common on small/angled classroom faces) we
+            # fall back to a texture check: the upper region must show real
+            # facial detail (skin/eye/brow structure), not a flat, low-detail
+            # patch such as the back of a head, hair, an ear, or a fragment
+            # that only captures the lower half of a face.
+            upper_landmark_evidence = eyes or brow
+            upper_texture_evidence = upper_std > 14.0 and upper_edges > 0.02
+
+            if not upper_landmark_evidence and not upper_texture_evidence:
+                return "insufficient"
+
+            # --- Occlusion scoring for faces that do have upper-face evidence.
             # Score independent signals instead of relying on one brittle rule.
             score = 0
 
@@ -397,6 +428,18 @@ class ClassroomAttendanceSystem:
             return "clear"
         except Exception:
             return "clear"
+
+    def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
+        """Backward-compatible binary wrapper around ``classify_face_visibility``.
+
+        Kept for any caller that only understands clear/masked. New code
+        should call ``classify_face_visibility`` directly to also get the
+        "insufficient" (no upper-face evidence) state.
+        """
+        visibility = self.classify_face_visibility(
+            rgb_image, location, encoding_available=encoding_available
+        )
+        return "masked" if visibility in ("masked", "insufficient") else "clear"
 
     @staticmethod
     def _fallback_occlusion_classification(rgb_crop):
@@ -735,12 +778,17 @@ class ClassroomAttendanceSystem:
             strong_limit = min(float(tolerance), 0.58)
             relaxed_limit = max(float(tolerance), 0.62)
 
+            # A face is only ever accepted as a match at 50% confidence or
+            # above. Anything under that bar is left unassigned and the face
+            # is reported as Unrecognized rather than risking a wrong name.
+            floor = max(0.50, float(min_confidence))
+
             accepted = False
-            if best_distance <= strong_limit and confidence >= 0.40:
+            if best_distance <= strong_limit and confidence >= floor:
                 accepted = True
             elif (
                 best_distance <= relaxed_limit
-                and confidence >= max(0.36, float(min_confidence))
+                and confidence >= floor
                 and margin >= 0.075
             ):
                 accepted = True
