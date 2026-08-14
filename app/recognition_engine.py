@@ -9,7 +9,7 @@ import json
 import urllib.request
 import threading
 
-MIN_CONFIDENCE = 0.45
+MIN_CONFIDENCE = 0.40
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
@@ -356,12 +356,15 @@ class ClassroomAttendanceSystem:
             # Score independent signals instead of relying on one brittle rule.
             score = 0
 
-            # Eyes visible but mouth structure missing is a strong occlusion cue.
+            # Eyes visible while the mouth landmark disappears is the strongest
+            # generic mask/face-covering cue available here.  Do not require the
+            # nose landmark to disappear: ordinary surgical masks often leave
+            # enough of the nose visible for the landmark model to find it.
             if eyes and not mouth:
                 score += 2
 
-            # If eyes are visible but both mouth and nose structure are absent,
-            # this is particularly useful for niqab/face-covering cases.
+            # A completely covered lower face (mask/niqab) is an even stronger
+            # signal when both mouth and nose landmarks disappear.
             if eyes and not mouth and not nose:
                 score += 2
 
@@ -390,9 +393,13 @@ class ClassroomAttendanceSystem:
             if eyes and lower_edges < max(upper_edges * 0.82, 0.018):
                 score += 1
 
-            # Require strong evidence.  This reduces false positives on sideways,
-            # downward-facing and low-resolution clear faces.
-            if score >= 3:
+            # For a visible pair of eyes with no mouth landmark, require one
+            # additional lower-face cue.  This catches masks whose nose landmark
+            # is still visible while avoiding classifying every small/sideways
+            # face as masked.  A full lower-face covering is accepted directly.
+            strong_full_cover = eyes and not mouth and not nose
+            partial_cover = eyes and not mouth and (texture_flat or dark_cover or lower_edges < max(upper_edges * 0.82, 0.018))
+            if strong_full_cover or partial_cover or score >= 3:
                 return "masked"
             return "clear"
         except Exception:
@@ -663,7 +670,7 @@ class ClassroomAttendanceSystem:
         face_encodings_by_index: dict[int, np.ndarray | None],
         tolerance: float,
         allowed_set: set | None,
-        min_confidence: float = MIN_CONFIDENCE,
+        min_confidence: float = 0.40,
     ) -> dict[int, tuple[int | None, str, float]]:
         """Assign clear detected faces to enrolled students without duplicates.
 
@@ -741,7 +748,7 @@ class ClassroomAttendanceSystem:
                 accepted = True
             elif (
                 best_distance <= relaxed_limit
-                and confidence >= max(0.36, float(min_confidence))
+                and confidence >= max(0.40, float(min_confidence))
                 and margin >= 0.075
             ):
                 accepted = True
