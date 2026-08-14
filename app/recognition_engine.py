@@ -445,7 +445,75 @@ class ClassroomAttendanceSystem:
             except Exception as e:
                 print(f"Profile Haar fallback failed: {e}")
 
-        # 4) Last-resort HOG tile retries. One tile at a time keeps Railway RAM
+        # 4) Eye-based fallback for masked faces.
+        # Masks often make the normal face classifier fail because the nose and
+        # mouth are covered. The eye cascade still sees the upper face. Use both
+        # eye-pair and single-eye proposals, but only as recovery detections and
+        # let IoU merging remove duplicates from HOG/Haar.
+        if len(merged) < 4:
+            try:
+                eye_cascades = [
+                    cv2.CascadeClassifier(
+                        os.path.join(cv2.data.haarcascades, "haarcascade_eye.xml")
+                    ),
+                    cv2.CascadeClassifier(
+                        os.path.join(cv2.data.haarcascades, "haarcascade_eye_tree_eyeglasses.xml")
+                    ),
+                ]
+                eyes = []
+                for eye_cascade in eye_cascades:
+                    if eye_cascade.empty():
+                        continue
+                    boxes = eye_cascade.detectMultiScale(
+                        gray,
+                        scaleFactor=1.06,
+                        minNeighbors=3,
+                        minSize=(8, 8),
+                        maxSize=(80, 80),
+                    )
+                    eyes.extend([tuple(map(int, b)) for b in boxes])
+
+                eye_items = []
+                for ex, ey, ew, eh in eyes:
+                    eye_items.append((ex + ew / 2.0, ey + eh / 2.0, ew, eh))
+
+                # Pair two eyes when both are visible.
+                for i, (cx1, cy1, ew1, eh1) in enumerate(eye_items):
+                    for j in range(i + 1, len(eye_items)):
+                        cx2, cy2, ew2, eh2 = eye_items[j]
+                        avg_h = max(1.0, (eh1 + eh2) / 2.0)
+                        dx = abs(cx2 - cx1)
+                        dy = abs(cy2 - cy1)
+                        if dy > avg_h * 1.1 or dx < avg_h * 1.4 or dx > avg_h * 7.0:
+                            continue
+                        face_w = int(round(dx * 1.8))
+                        face_h = int(round(face_w * 1.18))
+                        cx = (cx1 + cx2) / 2.0
+                        cy = (cy1 + cy2) / 2.0 + face_h * 0.16
+                        x0 = int(round(cx - face_w / 2.0))
+                        y0 = int(round(cy - face_h / 2.0))
+                        x1, y1 = x0 + face_w, y0 + face_h
+                        if 0 <= x0 < x1 <= gray.shape[1] and 0 <= y0 < y1 <= gray.shape[0]:
+                            if face_w >= 28 and face_h >= 28:
+                                add_full((y0, x1, y1, x0))
+
+                # If only one eye is visible (common with a turned/masked face),
+                # create a conservative proposal around that eye.
+                if len(merged) < 4:
+                    for cx, cy, ew, eh in eye_items:
+                        face_w = int(round(max(ew * 4.0, 42)))
+                        face_h = int(round(face_w * 1.15))
+                        x0 = int(round(cx - face_w * 0.50))
+                        y0 = int(round(cy - face_h * 0.30))
+                        x1, y1 = x0 + face_w, y0 + face_h
+                        if 0 <= x0 < x1 <= gray.shape[1] and 0 <= y0 < y1 <= gray.shape[0]:
+                            add_full((y0, x1, y1, x0))
+
+                merged = self._merge_locations(detections, iou_threshold=0.25)
+            except Exception as e:
+                print(f"Eye-based masked-face fallback failed: {e}")
+
+        # 5) Last-resort HOG tile retries. One tile at a time keeps Railway RAM
         # usage bounded. Usually Haar recovers small/masked faces before this.
         if len(merged) < 4:
             dh, dw = detect_img.shape[:2]
@@ -512,10 +580,10 @@ class ClassroomAttendanceSystem:
 
             gray = cv2.cvtColor(face, cv2.COLOR_RGB2GRAY)
             eye_cascade = cv2.CascadeClassifier(
-                os.path.join(cv2.data.haarcascades, "haarcascade_eye_tree_eyeglasses.xml")
+                os.path.join(cv2.data.haarcascades, "haarcascade_eye.xml")
             )
             eyes = () if eye_cascade.empty() else eye_cascade.detectMultiScale(
-                gray, scaleFactor=1.08, minNeighbors=3, minSize=(8, 8)
+                gray, scaleFactor=1.06, minNeighbors=3, minSize=(8, 8), maxSize=(70, 70)
             )
 
             landmarks = face_recognition.face_landmarks(
