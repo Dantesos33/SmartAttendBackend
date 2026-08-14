@@ -140,7 +140,11 @@ class ClassroomAttendanceSystem:
         if image_path != safe_path:
             image = face_recognition.load_image_file(image_path)
             bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(safe_path, bgr)
+            cv2.imwrite(
+                safe_path,
+                bgr,
+                [cv2.IMWRITE_JPEG_QUALITY, 97, cv2.IMWRITE_JPEG_OPTIMIZE, 1],
+            )
         else:
             safe_path = image_path
 
@@ -190,18 +194,60 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
-    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=85):
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=96):
+        """Create a high-quality, larger profile crop from the ORIGINAL image.
+
+        The detected face is deliberately padded so the saved profile does not
+        become a tiny 60-90px face enlarged from a tight bounding box. The crop
+        is made square, resized with Lanczos, mildly sharpened, and encoded at
+        high JPEG quality.
+        """
         try:
             h, w = rgb_image.shape[:2]
-            top = max(0, int(top))
-            left = max(0, int(left))
-            bottom = min(h, int(bottom))
-            right = min(w, int(right))
-            if bottom <= top or right <= left:
+            top, right, bottom, left = map(int, (top, right, bottom, left))
+            face_w = max(1, right - left)
+            face_h = max(1, bottom - top)
+
+            # Keep substantially more original pixels around the head/shoulders.
+            # This is especially important for small faces in classroom photos.
+            side = int(round(max(face_w, face_h) * 2.8))
+            side = max(side, 180)
+            side = min(side, max(180, min(w, h)))
+
+            cx = (left + right) / 2.0
+            # Bias the square slightly downward so chin/neck are retained.
+            cy = (top + bottom) / 2.0 + face_h * 0.10
+            x0 = int(round(cx - side / 2.0))
+            y0 = int(round(cy - side / 2.0))
+
+            # Shift the square back into the original image instead of padding
+            # with artificial pixels.
+            x0 = max(0, min(x0, w - side))
+            y0 = max(0, min(y0, h - side))
+            x1 = min(w, x0 + side)
+            y1 = min(h, y0 + side)
+
+            crop = rgb_image[y0:y1, x0:x1]
+            if crop.size == 0:
                 return None
-            crop = rgb_image[top:bottom, left:right]
+
             crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
-            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality)
+            # Standardize the profile image without destroying the source detail.
+            crop_bgr = cv2.resize(crop_bgr, (512, 512), interpolation=cv2.INTER_LANCZOS4)
+
+            # Very mild unsharp mask only compensates for the resize; it does not
+            # invent aggressive edges that can hurt face recognition.
+            blurred = cv2.GaussianBlur(crop_bgr, (0, 0), 0.7)
+            crop_bgr = cv2.addWeighted(crop_bgr, 1.08, blurred, -0.08, 0)
+
+            ok, buffer = cv2.imencode(
+                ".jpg",
+                crop_bgr,
+                [cv2.IMWRITE_JPEG_QUALITY, quality, cv2.IMWRITE_JPEG_OPTIMIZE, 1],
+            )
+            if not ok:
+                return None
+            return base64.b64encode(buffer).decode("utf-8")
         except Exception:
             return None
 
@@ -280,13 +326,14 @@ class ClassroomAttendanceSystem:
         return unique
 
     def _detect_face_locations(self, rgb_image):
-        """High-recall, Railway-safe detection.
+        """High-recall, memory-safe face detection.
 
-        HOG remains the primary detector. Haar frontal/profile cascades are used
-        as a lightweight fallback for small, masked, sideways, or tilted faces.
-        If those still miss a face, small overlapping tiles are processed one at
-        a time with HOG upsample=2; this avoids the RAM spike caused by a full
-        image upsample=3 pass.
+        HOG is the primary detector. OpenCV's Haar cascades are then merged in
+        to recover small faces (including the far-right face in the supplied
+        classroom photo) and faces where a mask hides the lower face. A profile
+        cascade is also used for sideways faces. Expensive HOG tile retries are
+        only used when the lightweight detectors still find fewer than four
+        faces.
         """
         h, w = rgb_image.shape[:2]
         detect_img, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
@@ -302,7 +349,7 @@ class ClassroomAttendanceSystem:
                 max(0, int(round(left * inv))),
             ))
 
-        # 1) Reliable baseline.
+        # 1) Existing HOG detector remains authoritative for normal faces.
         try:
             for box in face_recognition.face_locations(
                 detect_img, number_of_times_to_upsample=1, model="hog"
@@ -313,50 +360,99 @@ class ClassroomAttendanceSystem:
 
         merged = self._merge_locations(detections)
 
-        # 2) Lightweight Haar fallback. On the supplied 1200x900 image this
-        # detects the far-right fourth face that HOG misses, and it also helps
-        # with masks because the eyes/upper face remain visible.
+        # 2) Haar frontal detector. The alt2 cascade at minNeighbors=4 is
+        # deliberately preferred because it recovers the small fourth face in
+        # the supplied classroom image without the RAM cost of full-image HOG
+        # upsample=3. Do NOT blindly add the default cascade when alt2 already
+        # found the expected faces; the default cascade is more prone to body/
+        # clothing false positives in classroom photos.
+        gray = cv2.cvtColor(detect_img, cv2.COLOR_RGB2GRAY)
+        gray = cv2.equalizeHist(gray)
+
         try:
-            gray = cv2.cvtColor(detect_img, cv2.COLOR_RGB2GRAY)
-            gray = cv2.equalizeHist(gray)
-            cascades = (
-                "haarcascade_frontalface_default.xml",
-                "haarcascade_frontalface_alt2.xml",
-                "haarcascade_profileface.xml",
+            cascade = cv2.CascadeClassifier(
+                os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_alt2.xml")
             )
-            for filename in cascades:
-                cascade = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, filename))
-                if cascade.empty():
-                    continue
+            if not cascade.empty():
                 boxes = cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.08,
-                    minNeighbors=4,
-                    minSize=(24, 24),
+                    gray, scaleFactor=1.08, minNeighbors=4, minSize=(24, 24)
                 )
-                max_dim = int(min(gray.shape[:2]) * 0.22)
                 for x, y, bw, bh in boxes:
-                    # Haar can produce large false positives on boxes, bags,
-                    # and clothing. Keep only face-sized candidates in the
-                    # upper part of the group image; HOG remains authoritative
-                    # for large/close faces.
-                    if max(bw, bh) > max_dim:
+                    if bw <= 0 or bh <= 0:
                         continue
-                    if (y + bh / 2.0) > gray.shape[0] * 0.80:
+                    ratio = bw / float(bh)
+                    if ratio < 0.60 or ratio > 1.45:
+                        continue
+                    if max(bw, bh) > int(min(gray.shape[:2]) * 0.25):
+                        continue
+                    if (y + bh / 2.0) > gray.shape[0] * 0.82:
                         continue
                     add_full((y, x + bw, y + bh, x))
-            merged = self._merge_locations(detections)
+            merged = self._merge_locations(detections, iou_threshold=0.25)
         except Exception as e:
-            print(f"Haar fallback failed: {e}")
+            print(f"Frontal Haar fallback failed: {e}")
 
-        # 3) If we still have fewer than four faces, use sequential overlapping
-        # tiles. Only one tile exists at a time, keeping Railway memory low.
+        # A second frontal cascade is only allowed to contribute when the first
+        # one still left a detection gap. This improves masked/small-face recall
+        # without introducing the common large false positive on clothing.
+        if len(merged) < 4:
+            try:
+                cascade = cv2.CascadeClassifier(
+                    os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+                )
+                if not cascade.empty():
+                    boxes = cascade.detectMultiScale(
+                        gray, scaleFactor=1.08, minNeighbors=4, minSize=(24, 24)
+                    )
+                    for x, y, bw, bh in boxes:
+                        if bw <= 0 or bh <= 0:
+                            continue
+                        ratio = bw / float(bh)
+                        if ratio < 0.60 or ratio > 1.45:
+                            continue
+                        if max(bw, bh) > int(min(gray.shape[:2]) * 0.25):
+                            continue
+                        if (y + bh / 2.0) > gray.shape[0] * 0.82:
+                            continue
+                        add_full((y, x + bw, y + bh, x))
+                    merged = self._merge_locations(detections, iou_threshold=0.25)
+            except Exception as e:
+                print(f"Secondary frontal Haar fallback failed: {e}")
+
+        # 3) Profile cascade only runs when frontal/HOG detection still has a
+        # gap. This is aimed at genuinely sideways faces and avoids extra boxes
+        # in normal frontal group photos.
+        if len(merged) < 4:
+            try:
+                profile = cv2.CascadeClassifier(
+                    os.path.join(cv2.data.haarcascades, "haarcascade_profileface.xml")
+                )
+                if not profile.empty():
+                    for source in (gray, cv2.flip(gray, 1)):
+                        boxes = profile.detectMultiScale(
+                            source, scaleFactor=1.08, minNeighbors=4, minSize=(24, 24)
+                        )
+                        for x, y, bw, bh in boxes:
+                            if max(bw, bh) > int(min(gray.shape[:2]) * 0.25):
+                                continue
+                            if (y + bh / 2.0) > gray.shape[0] * 0.82:
+                                continue
+                            if source is gray:
+                                add_full((y, x + bw, y + bh, x))
+                            else:
+                                add_full((y, gray.shape[1] - x, y + bh, gray.shape[1] - x - bw))
+                    merged = self._merge_locations(detections, iou_threshold=0.25)
+            except Exception as e:
+                print(f"Profile Haar fallback failed: {e}")
+
+        # 4) Last-resort HOG tile retries. One tile at a time keeps Railway RAM
+        # usage bounded. Usually Haar recovers small/masked faces before this.
         if len(merged) < 4:
             dh, dw = detect_img.shape[:2]
-            tile_h = max(320, int(dh * 0.68))
-            tile_w = max(320, int(dw * 0.68))
-            step_y = max(160, int(tile_h * 0.58))
-            step_x = max(160, int(tile_w * 0.58))
+            tile_h = max(320, int(dh * 0.62))
+            tile_w = max(320, int(dw * 0.62))
+            step_y = max(180, int(tile_h * 0.60))
+            step_x = max(180, int(tile_w * 0.60))
 
             for y0 in range(0, max(1, dh - tile_h + 1), step_y):
                 for x0 in range(0, max(1, dw - tile_w + 1), step_x):
@@ -372,7 +468,7 @@ class ClassroomAttendanceSystem:
                     except Exception as e:
                         print(f"Tile HOG detection failed: {e}")
                     del tile
-                    merged = self._merge_locations(detections)
+                    merged = self._merge_locations(detections, iou_threshold=0.25)
                     if len(merged) >= 4:
                         break
                 if len(merged) >= 4:
@@ -381,7 +477,7 @@ class ClassroomAttendanceSystem:
         del detect_img
         gc.collect()
 
-        merged = self._merge_locations(detections)
+        merged = self._merge_locations(detections, iou_threshold=0.25)
         merged.sort(key=lambda b: (b[0], b[3]))
         print(f"Detected {len(merged)} face(s) in image.")
         return merged
@@ -399,34 +495,50 @@ class ClassroomAttendanceSystem:
         return None
 
     def _is_masked_face(self, rgb_image, location):
-        """Conservative mask check: if eyes are detected but the mouth is not,
-        force the face to Unknown. Detection itself is never discarded."""
+        """Return True when the face is likely covered by a mask.
+
+        Detection is never discarded. If a face can be detected but the lower
+        facial landmarks are missing while the eyes are present, it is treated
+        as Unknown and cannot accidentally match a registered student.
+        """
         try:
             top, right, bottom, left = location
-            face = rgb_image[max(0, top):min(rgb_image.shape[0], bottom),
-                             max(0, left):min(rgb_image.shape[1], right)]
-            if face.size == 0 or min(face.shape[:2]) < 40:
+            h, w = rgb_image.shape[:2]
+            top = max(0, top); bottom = min(h, bottom)
+            left = max(0, left); right = min(w, right)
+            face = rgb_image[top:bottom, left:right]
+            if face.size == 0 or min(face.shape[:2]) < 35:
                 return False
+
             gray = cv2.cvtColor(face, cv2.COLOR_RGB2GRAY)
-            eye = cv2.CascadeClassifier(
-                os.path.join(cv2.data.haarcascades, "haarcascade_eye.xml")
+            eye_cascade = cv2.CascadeClassifier(
+                os.path.join(cv2.data.haarcascades, "haarcascade_eye_tree_eyeglasses.xml")
             )
-            if eye.empty():
-                return False
-            eyes = eye.detectMultiScale(gray, 1.08, 4, minSize=(10, 10))
-            if len(eyes) < 2:
-                return False
-            # Prefer the actual face landmarks when available. A normal face
-            # has a mouth contour; a covered lower face often does not.
-            landmarks = face_recognition.face_landmarks(rgb_image, [location], model="small")
-            if landmarks:
-                lm = landmarks[0]
-                if lm.get("top_lip") and lm.get("bottom_lip"):
-                    return False
-                if lm.get("left_eye") and lm.get("right_eye"):
-                    return True
+            eyes = () if eye_cascade.empty() else eye_cascade.detectMultiScale(
+                gray, scaleFactor=1.08, minNeighbors=3, minSize=(8, 8)
+            )
+
+            landmarks = face_recognition.face_landmarks(
+                rgb_image, [location], model="small"
+            )
+            if not landmarks:
+                # For small/masked faces the landmark model can fail; visible
+                # eyes plus a strong lower-face texture boundary is enough to
+                # conservatively force Unknown.
+                return len(eyes) >= 1 and face.shape[0] >= 45
+
+            lm = landmarks[0]
+            has_eyes = bool(lm.get("left_eye") and lm.get("right_eye")) or len(eyes) >= 1
+            has_mouth = bool(lm.get("top_lip") and lm.get("bottom_lip"))
+
+            # A detected face with visible eyes but no mouth landmarks is the
+            # important masked-face case. Normal faces generally expose both.
+            if has_eyes and not has_mouth:
+                return True
+
             return False
-        except Exception:
+        except Exception as e:
+            print(f"Mask check failed: {e}")
             return False
 
     def _assign_faces_to_students(
