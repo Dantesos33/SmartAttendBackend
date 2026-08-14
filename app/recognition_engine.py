@@ -6,14 +6,10 @@ import base64
 import gc
 from datetime import datetime
 import json
-import urllib.request
-import threading
 
 MIN_CONFIDENCE = 0.45
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
-YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
-YUNET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
 
 
 class ClassroomAttendanceSystem:
@@ -28,8 +24,6 @@ class ClassroomAttendanceSystem:
         os.makedirs(self.known_students_dir, exist_ok=True)
         self.metadata = self._load_json(self.metadata_path, {})
         self.sessions = self._load_json(self.sessions_path, [])
-        self._yunet_detector = None
-        self._yunet_lock = threading.Lock()
         self.load_known_students_from_dir()
 
     def _load_json(self, path, default):
@@ -221,99 +215,125 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
-    def _get_yunet_detector(self, input_size):
-        """Return a lightweight YuNet detector. The model is downloaded once if absent.
-
-        YuNet is used instead of Haar Cascade because some Railway OpenCV builds do
-        not expose CascadeClassifier. It is also substantially better for small,
-        partially occluded and non-frontal faces.
-        """
-        if not hasattr(cv2, "FaceDetectorYN"):
-            return None
-        os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True)
-        if not os.path.exists(YUNET_MODEL_PATH):
-            tmp = YUNET_MODEL_PATH + ".download"
-            try:
-                with self._yunet_lock:
-                    if not os.path.exists(YUNET_MODEL_PATH):
-                        print("Downloading YuNet face detector model...")
-                        urllib.request.urlretrieve(YUNET_MODEL_URL, tmp)
-                        os.replace(tmp, YUNET_MODEL_PATH)
-            except Exception as exc:
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except Exception:
-                    pass
-                print(f"YuNet model download failed: {exc}")
-                return None
-        try:
-            detector = cv2.FaceDetectorYN.create(
-                YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
-                0.35, 0.30, 5000
-            )
-            return detector
-        except Exception as exc:
-            print(f"YuNet initialization failed: {exc}")
-            return None
-
-    def _yunet_locations(self, bgr_image):
-        h, w = bgr_image.shape[:2]
-        detector = self._get_yunet_detector((w, h))
-        if detector is None:
-            return []
-        try:
-            detector.setInputSize((w, h))
-            _, detections = detector.detect(bgr_image)
-            if detections is None:
-                return []
-            results = []
-            for row in detections:
-                x, y, bw, bh, score = [float(v) for v in row[:5]]
-                if score < 0.35 or bw < 10 or bh < 10:
-                    continue
-                results.append((int(y), int(x+bw), int(y+bh), int(x)))
-            return results
-        except Exception as exc:
-            print(f"YuNet detection failed: {exc}")
-            return []
-
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
-        """Classify an already detected face without ever preventing detection.
+        """Stage-2 occlusion classifier.
 
-        This is intentionally a status classifier, not a detector. It uses the
-        lower-face image plus encoding availability to catch obvious masks/niqabs
-        while keeping difficult poses in the pipeline.
+        Detection is identity-independent. A clear face that successfully
+        produces a face embedding must NOT be labelled masked merely because
+        a mouth/smile detector failed (which was causing every face in group
+        photos to become masked). Visual occlusion evidence is therefore only
+        used when encoding is unavailable, and it must be strong before a face
+        is classified as masked. Otherwise the face remains clear/unrecognized.
         """
         top, right, bottom, left = [int(x) for x in location]
         h, w = rgb_image.shape[:2]
         top=max(0,top); left=max(0,left); bottom=min(h,bottom); right=min(w,right)
         if bottom <= top or right <= left:
-            return "masked"
+            return "clear"
+
         crop = rgb_image[top:bottom, left:right]
         ch, cw = crop.shape[:2]
-        if ch < 24 or cw < 24:
-            return "masked" if not encoding_available else "clear"
+        if ch < 32 or cw < 24:
+            return "clear"
 
-        # Masks/niqabs often make the lower 40% substantially more uniform or
-        # darker than the eye/forehead region. This is only a secondary signal;
-        # encoding failure remains the fallback for heavy occlusion.
-        lower = crop[int(ch * 0.58):]
-        upper = crop[int(ch * 0.12):int(ch * 0.45)]
-        lower_gray = cv2.cvtColor(lower, cv2.COLOR_RGB2GRAY)
-        upper_gray = cv2.cvtColor(upper, cv2.COLOR_RGB2GRAY)
-        lower_mean = float(np.mean(lower_gray))
-        upper_mean = float(np.mean(upper_gray))
-        lower_std = float(np.std(lower_gray))
-        upper_std = float(np.std(upper_gray))
+        # A valid embedding is strong evidence that the face is sufficiently
+        # visible for recognition. Do not turn normal unmasked faces into
+        # masked merely because legacy Haar mouth detection is unavailable.
+        if encoding_available:
+            return "clear"
 
-        dark_or_uniform_lower = (lower_mean < 72 and lower_std < upper_std * 0.92)
-        very_uniform_lower = lower_std < max(10.0, upper_std * 0.42)
-        if dark_or_uniform_lower or very_uniform_lower:
-            return "masked"
-        if not encoding_available:
-            return "masked"
-        return "clear"
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+            upper = gray[int(ch * 0.15):int(ch * 0.52), :]
+            lower = gray[int(ch * 0.50):int(ch * 0.92), :]
+            if upper.size == 0 or lower.size == 0:
+                return "clear"
+
+            # Look for strong lower-face occlusion. These are deliberately
+            # conservative signals: failed recognition alone is NOT enough to
+            # call a face masked, otherwise sideways/downward clear faces would
+            # all become masked.
+            upper_mean = float(np.mean(upper))
+            lower_mean = float(np.mean(lower))
+            upper_std = float(np.std(upper))
+            lower_std = float(np.std(lower))
+
+            # Legacy Haar is optional. If present, use it only as supporting
+            # evidence, never as the sole reason to classify a face as masked.
+            eyes = 0
+            smiles = 0
+            cascade_cls = getattr(cv2, "CascadeClassifier", None)
+            haar_root = getattr(getattr(cv2, "data", None), "haarcascades", None)
+            if cascade_cls is not None and haar_root:
+                try:
+                    eye_path = os.path.join(haar_root, "haarcascade_eye_tree_eyeglasses.xml")
+                    smile_path = os.path.join(haar_root, "haarcascade_smile.xml")
+                    if os.path.exists(eye_path):
+                        eye = cascade_cls(eye_path)
+                        if not eye.empty():
+                            detections = eye.detectMultiScale(
+                                gray, 1.08, 5,
+                                minSize=(max(6, cw // 10), max(6, ch // 10)),
+                            )
+                            eyes = len(detections)
+                    if os.path.exists(smile_path):
+                        smile = cascade_cls(smile_path)
+                        if not smile.empty():
+                            lower_region = gray[int(ch * 0.48):, :]
+                            detections = smile.detectMultiScale(
+                                lower_region, 1.7, 25,
+                                minSize=(max(8, cw // 7), max(5, ch // 12)),
+                            )
+                            smiles = len(detections)
+                except Exception:
+                    pass
+
+            dark_flat_lower = (
+                upper_mean > 40 and
+                lower_mean < upper_mean * 0.62 and
+                lower_std < max(upper_std * 0.82, 8.0)
+            )
+            eye_pair_without_lower_detail = eyes >= 2 and smiles == 0 and lower_std < max(upper_std * 0.75, 9.0)
+
+            if dark_flat_lower or eye_pair_without_lower_detail:
+                return "masked"
+
+            # No strong visual evidence: keep the face clear so enrollment
+            # matching can decide whether it is an unrecognized student.
+            return "clear"
+        except Exception:
+            return "clear"
+
+    @staticmethod
+    def _fallback_occlusion_classification(rgb_crop):
+        """Safe fallback when Haar cascades are unavailable.
+
+        This intentionally returns clear unless there is a strong lower-face
+        occlusion signal. It is better to keep a detected face in the pipeline
+        than to crash or silently discard it when an optional OpenCV component
+        is missing.
+        """
+        try:
+            h, w = rgb_crop.shape[:2]
+            if h < 24 or w < 24:
+                return "clear"
+            gray = cv2.cvtColor(rgb_crop, cv2.COLOR_RGB2GRAY)
+            upper = gray[int(h * 0.18):int(h * 0.52), :]
+            lower = gray[int(h * 0.52):int(h * 0.92), :]
+            if upper.size == 0 or lower.size == 0:
+                return "clear"
+            # A very low-variance, strongly darker lower-face region is a useful
+            # conservative signal for masks/niqab, without rejecting normal
+            # faces based on colour.
+            upper_mean = float(np.mean(upper))
+            lower_mean = float(np.mean(lower))
+            upper_std = float(np.std(upper))
+            lower_std = float(np.std(lower))
+            if upper_mean > 35 and lower_mean < upper_mean * 0.58 and lower_std < upper_std * 0.9:
+                return "masked"
+            return "clear"
+        except Exception:
+            return "clear"
 
     @staticmethod
     def _downscale_rgb(rgb_image, max_edge):
@@ -382,10 +402,10 @@ class ClassroomAttendanceSystem:
             t = max(0, min(h - 1, t)); b = max(0, min(h, b))
             l = max(0, min(w - 1, l)); r = max(0, min(w, r))
             bw, bh = r - l, b - t
-            if bw < 14 or bh < 14:
+            if bw < 24 or bh < 24:
                 continue
             ratio = bw / float(max(1, bh))
-            if ratio < 0.38 or ratio > 2.2:
+            if ratio < 0.45 or ratio > 1.9:
                 continue
             candidates.append((t, r, b, l))
 
@@ -416,9 +436,70 @@ class ClassroomAttendanceSystem:
         return (t, r, b, l)
 
     def _eye_pair_face_proposals(self, rgb_image):
-        # Legacy compatibility hook. Haar cascades are intentionally not used
-        # because some production OpenCV builds omit CascadeClassifier.
-        return []
+        """Recover niqab/mask faces where only the eye region is visible.
+
+        We only create a face proposal when two eye detections have plausible
+        spacing/alignment. This is intentionally conservative so random eyes
+        in posters/backgrounds do not turn into dozens of face boxes.
+        """
+        gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape[:2]
+        cascade_cls = getattr(cv2, "CascadeClassifier", None)
+        haar_root = getattr(getattr(cv2, "data", None), "haarcascades", None)
+        if cascade_cls is None or not haar_root:
+            return []
+        eye_path = os.path.join(haar_root, "haarcascade_eye_tree_eyeglasses.xml")
+        if not os.path.exists(eye_path):
+            return []
+        try:
+            cascade = cascade_cls(eye_path)
+        except Exception as exc:
+            print(f"Eye Haar cascade unavailable: {exc}")
+            return []
+        if cascade.empty():
+            return []
+
+        min_eye = max(10, int(min(h, w) * 0.012))
+        eyes = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.08,
+            minNeighbors=5,
+            minSize=(min_eye, min_eye),
+        )
+        if len(eyes) < 2:
+            return []
+
+        proposals = []
+        centers = []
+        for x, y, ew, eh in eyes:
+            centers.append((x + ew / 2.0, y + eh / 2.0, ew, eh))
+
+        for i, (x1, y1, ew1, eh1) in enumerate(centers):
+            for x2, y2, ew2, eh2 in centers[i + 1:]:
+                dx = abs(x2 - x1)
+                dy = abs(y2 - y1)
+                eye_size = max(ew1, eh1, ew2, eh2)
+                if dx < eye_size * 1.4 or dx > eye_size * 10.0:
+                    continue
+                if dy > max(eye_size * 0.9, dx * 0.28):
+                    continue
+
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                face_w = max(dx * 2.45, eye_size * 5.0)
+                face_h = face_w * 1.28
+                left = int(cx - face_w / 2.0)
+                right = int(cx + face_w / 2.0)
+                top = int(cy - face_h * 0.38)
+                bottom = int(cy + face_h * 0.62)
+
+                if right-left < 28 or bottom-top < 28:
+                    continue
+                if right-left > w * 0.32 or bottom-top > h * 0.45:
+                    continue
+                proposals.append((top, right, bottom, left))
+
+        return self._dedupe_face_locations(proposals, rgb_image.shape)
 
     def _detect_face_locations(self, rgb_image):
         """Detect faces independently of recognition, including difficult group-photo faces.
@@ -456,15 +537,71 @@ class ClassroomAttendanceSystem:
         except Exception as exc:
             print(f"Primary HOG detection failed: {exc}")
 
-        # 2) YuNet is the primary recovery detector. It handles small,
-        # partially occluded, profile and masked faces much better than Haar.
-        try:
-            yunet_input = cv2.cvtColor(detect_img, cv2.COLOR_RGB2BGR)
-            for loc in self._yunet_locations(yunet_input):
-                raw.append(restore(loc))
-            del yunet_input
-        except Exception as exc:
-            print(f"YuNet recovery failed: {exc}")
+        gray = cv2.cvtColor(detect_img, cv2.COLOR_RGB2GRAY)
+        # OpenCV Haar cascades are optional recovery detectors. Some production
+        # cv2 builds do not expose CascadeClassifier at all, so never let the
+        # optional detector take down the complete recognition request.
+        cascade_cls = getattr(cv2, "CascadeClassifier", None)
+        haar_root = getattr(getattr(cv2, "data", None), "haarcascades", None)
+
+        def make_cascade(filename):
+            if cascade_cls is None or not haar_root:
+                return None
+            path = os.path.join(haar_root, filename)
+            if not os.path.exists(path):
+                return None
+            try:
+                detector = cascade_cls(path)
+                return detector if not detector.empty() else None
+            except Exception as exc:
+                print(f"Optional Haar detector {filename} unavailable: {exc}")
+                return None
+
+        frontal = make_cascade("haarcascade_frontalface_alt2.xml")
+        profile = make_cascade("haarcascade_profileface.xml")
+
+        # 2) Frontal/profile Haar recovery. minNeighbors is deliberately high
+        # enough to avoid the 32+ false boxes seen with the old eye-only pass.
+        min_face = max(22, int(min(detect_img.shape[:2]) * 0.035))
+        eye_probe = make_cascade("haarcascade_eye_tree_eyeglasses.xml")
+
+        def haar_has_eye_signal(x, y, bw, bh, allow_single=True):
+            if eye_probe is None:
+                return True
+            x1 = max(0, x); y1 = max(0, y)
+            x2 = min(gray.shape[1], x + bw); y2 = min(gray.shape[0], y + int(bh * 0.72))
+            roi = gray[y1:y2, x1:x2]
+            if roi.size == 0:
+                return False
+            ey = eye_probe.detectMultiScale(
+                roi, scaleFactor=1.08, minNeighbors=5,
+                minSize=(max(5, int(bw * 0.08)), max(5, int(bh * 0.08))),
+            )
+            return len(ey) >= (1 if allow_single else 2)
+
+        if frontal is not None:
+            boxes = frontal.detectMultiScale(
+                gray, scaleFactor=1.06, minNeighbors=7,
+                minSize=(min_face, min_face),
+            )
+            for x, y, bw, bh in boxes:
+                # Reject background rectangles such as bags/clothing that the
+                # frontal cascade occasionally produces. Real faces normally
+                # have at least one eye signal in the upper face region.
+                if haar_has_eye_signal(x, y, bw, bh, allow_single=True):
+                    raw.append(restore((y, x+bw, y+bh, x)))
+
+        if profile is not None:
+            for source, mirrored in ((gray, False), (cv2.flip(gray, 1), True)):
+                boxes = profile.detectMultiScale(
+                    source, scaleFactor=1.06, minNeighbors=6,
+                    minSize=(min_face, min_face),
+                )
+                for x, y, bw, bh in boxes:
+                    if mirrored:
+                        x = gray.shape[1] - x - bw
+                    if haar_has_eye_signal(x, y, bw, bh, allow_single=True):
+                        raw.append(restore((y, x+bw, y+bh, x)))
 
         # 3) Small-face tile recovery. A group photo can contain people whose
         # faces are only a few dozen pixels wide. HOG on the whole image can
@@ -474,8 +611,8 @@ class ClassroomAttendanceSystem:
         th, tw = detect_img.shape[:2]
         tile_w = max(420, int(tw * 0.62))
         tile_h = max(360, int(th * 0.62))
-        step_x = max(1, int(tile_w * 0.58))
-        step_y = max(1, int(tile_h * 0.58))
+        step_x = max(1, int(tile_w * 0.78))
+        step_y = max(1, int(tile_h * 0.78))
         xs = sorted(set([0, max(0, tw - tile_w)] + list(range(0, max(1, tw - tile_w + 1), step_x))))
         ys = sorted(set([0, max(0, th - tile_h)] + list(range(0, max(1, th - tile_h + 1), step_y))))
         for y0 in ys:
@@ -486,7 +623,7 @@ class ClassroomAttendanceSystem:
                 try:
                     # Upsample only the tile, not the complete classroom image.
                     for loc in face_recognition.face_locations(
-                        tile, number_of_times_to_upsample=2, model="hog"
+                        tile, number_of_times_to_upsample=1, model="hog"
                     ):
                         t, r, b, l = loc
                         raw.append(restore((t+y0, r+x0, b+y0, l+x0)))
@@ -511,17 +648,13 @@ class ClassroomAttendanceSystem:
             del rotated
             gc.collect()
 
-        # 5) A second YuNet pass on a 1.35x image catches distant/partially
-        # occluded faces that are below the effective size of the first pass.
+        # 5) Eye-pair recovery for masks/niqabs. Work on the already-downscaled
+        # image and restore boxes to original coordinates.
         try:
-            enlarged = cv2.resize(detect_img, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
-            for loc in self._yunet_locations(cv2.cvtColor(enlarged, cv2.COLOR_RGB2BGR)):
-                t,r,b,l = loc
-                raw.append(restore((int(t/1.35), int(r/1.35), int(b/1.35), int(l/1.35))))
-            del enlarged
-            gc.collect()
+            for loc in self._eye_pair_face_proposals(detect_img):
+                raw.append(restore(loc))
         except Exception as exc:
-            print(f"Enlarged YuNet recovery failed: {exc}")
+            print(f"Eye-pair recovery failed: {exc}")
 
         final_locations = self._dedupe_face_locations(raw, original.shape)
         print(f"Detected {len(final_locations)} face(s) in image.")
