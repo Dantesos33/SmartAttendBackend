@@ -429,8 +429,6 @@ class ClassroomAttendanceSystem:
         except Exception:
             return "clear"
 
-    @staticmethod
-
     def _has_upper_face_visible(self, rgb_image, location):
         """Post-detection gate: reject lower-face-only detections.
 
