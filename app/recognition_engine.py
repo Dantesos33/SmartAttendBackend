@@ -7,18 +7,12 @@ import gc
 from datetime import datetime
 import json
 
-MIN_CONFIDENCE = 0.48
-MAX_DETECT_EDGE = 1920
-MAX_DETECT_EDGE_LARGE = 2560
-MAX_ANNOTATED_EDGE = 1400
-LARGE_IMAGE_PIXELS = 2_000_000
+MIN_CONFIDENCE = 0.45
+MAX_DETECT_EDGE = 2000
+MAX_ANNOTATED_EDGE = 1200
+
 
 class ClassroomAttendanceSystem:
-    """
-    Keyed by real student_id (the database's users.id) rather than a typed
-    name string.
-    """
-
     def __init__(self, known_students_dir="known_students"):
         self.known_face_encodings = []
         self.known_face_ids = []
@@ -28,24 +22,25 @@ class ClassroomAttendanceSystem:
         self.sessions_path = "attendance_sessions.json"
 
         os.makedirs(self.known_students_dir, exist_ok=True)
-
         self.metadata = self._load_json(self.metadata_path, {})
         self.sessions = self._load_json(self.sessions_path, [])
-
         self.load_known_students_from_dir()
 
     def _load_json(self, path, default):
         if os.path.exists(path):
             try:
-                with open(path, "r") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
                 return default
         return default
 
     def _save_json(self, path, data):
-        with open(path, "w") as f:
-            json.dump(data, f, indent=4)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"Error saving {path}: {e}")
 
     def _encoding_to_json(self, encoding):
         return json.dumps([float(x) for x in encoding])
@@ -62,7 +57,6 @@ class ClassroomAttendanceSystem:
             return None
 
     def merge_student_encoding(self, student_id, name, encoding):
-        """Add or replace one student's embedding in memory."""
         if encoding is None:
             return
         if student_id in self.known_face_ids:
@@ -75,7 +69,6 @@ class ClassroomAttendanceSystem:
             self.known_face_names.append(name)
 
     def load_db_encodings(self, rows):
-        """Merge face embeddings persisted in the database."""
         loaded = 0
         for student_id, name, encoding_json in rows:
             encoding = self._json_to_encoding(encoding_json)
@@ -93,10 +86,12 @@ class ClassroomAttendanceSystem:
         return self.known_face_encodings[idx]
 
     def load_known_students_from_dir(self):
-        print("Loading known students...")
         self.known_face_encodings = []
         self.known_face_ids = []
         self.known_face_names = []
+
+        if not os.path.exists(self.known_students_dir):
+            return
 
         for filename in os.listdir(self.known_students_dir):
             if filename.lower().endswith((".png", ".jpg", ".jpeg")):
@@ -107,34 +102,22 @@ class ClassroomAttendanceSystem:
                 student_id = int(stem)
                 name = self.metadata.get(str(student_id), {}).get("name", f"Student {student_id}")
                 self._register_encoding(filepath, student_id, name)
-        print(f"Loaded {len(self.known_face_ids)} known students.")
 
     def _register_encoding(self, image_path, student_id, name):
         try:
             image = face_recognition.load_image_file(image_path)
-            image, _ = self._downscale_rgb(image, MAX_DETECT_EDGE)
-            locations = face_recognition.face_locations(image, number_of_times_to_upsample=1)
+            image, _ = self._downscale_rgb(image, 1280)
+            locations = face_recognition.face_locations(image, number_of_times_to_upsample=1, model="hog")
             if not locations:
                 return False, "No face detected in image.", None
             if len(locations) > 1:
                 return False, "Multiple faces detected — please use a photo with only one person.", None
 
-            encodings = face_recognition.face_encodings(
-                image,
-                [locations[0]],
-                num_jitters=1,
-            )
+            encodings = face_recognition.face_encodings(image, [locations[0]], num_jitters=1)
             if not encodings:
                 return False, "Could not encode face from image.", None
 
-            if student_id in self.known_face_ids:
-                idx = self.known_face_ids.index(student_id)
-                self.known_face_encodings[idx] = encodings[0]
-                self.known_face_names[idx] = name
-            else:
-                self.known_face_encodings.append(encodings[0])
-                self.known_face_ids.append(student_id)
-                self.known_face_names.append(name)
+            self.merge_student_encoding(student_id, name, encodings[0])
             return True, f"Successfully registered face for: {name}", encodings[0]
         except Exception as e:
             return False, f"Error processing image: {str(e)}", None
@@ -142,8 +125,8 @@ class ClassroomAttendanceSystem:
     def verify_face_quality(self, image_path):
         try:
             image = face_recognition.load_image_file(image_path)
-            image, _ = self._downscale_rgb(image, MAX_DETECT_EDGE)
-            locations = face_recognition.face_locations(image, number_of_times_to_upsample=1)
+            image, _ = self._downscale_rgb(image, 1280)
+            locations = face_recognition.face_locations(image, number_of_times_to_upsample=1, model="hog")
             if len(locations) == 0:
                 return False, "No face detected. Please upload a clear photo of your face."
             if len(locations) > 1:
@@ -191,82 +174,50 @@ class ClassroomAttendanceSystem:
             return False, f"Error removing student {student_id}: {str(e)}"
 
     def _encode_bgr_jpeg_base64(self, bgr_image, quality=75, max_edge=MAX_ANNOTATED_EDGE):
-        h, w = bgr_image.shape[:2]
-        if max(h, w) > max_edge:
-            scale = max_edge / max(h, w)
-            bgr_image = cv2.resize(
-                bgr_image,
-                (int(w * scale), int(h * scale)),
-                interpolation=cv2.INTER_AREA,
-            )
-        ok, buffer = cv2.imencode(".jpg", bgr_image, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if not ok:
+        try:
+            h, w = bgr_image.shape[:2]
+            if max(h, w) > max_edge:
+                scale = max_edge / max(h, w)
+                bgr_image = cv2.resize(
+                    bgr_image,
+                    (int(w * scale), int(h * scale)),
+                    interpolation=cv2.INTER_AREA,
+                )
+            ok, buffer = cv2.imencode(".jpg", bgr_image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if not ok:
+                return None
+            return base64.b64encode(buffer).decode("utf-8")
+        except Exception:
             return None
-        return base64.b64encode(buffer).decode("utf-8")
 
     def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=85):
-        h, w = rgb_image.shape[:2]
-        top = max(0, top)
-        left = max(0, left)
-        bottom = min(h, bottom)
-        right = min(w, right)
-        if bottom <= top or right <= left:
+        try:
+            h, w = rgb_image.shape[:2]
+            top = max(0, int(top))
+            left = max(0, int(left))
+            bottom = min(h, int(bottom))
+            right = min(w, int(right))
+            if bottom <= top or right <= left:
+                return None
+            crop = rgb_image[top:bottom, left:right]
+            crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality)
+        except Exception:
             return None
-        crop = rgb_image[top:bottom, left:right]
-        crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
-        return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality)
-
-    @staticmethod
-    def _box_area(top, right, bottom, left):
-        return max(0, bottom - top) * max(0, right - left)
-
-    @staticmethod
-    def _boxes_overlap(a, b):
-        a_top, a_right, a_bottom, a_left = a
-        b_top, b_right, b_bottom, b_left = b
-        inter_top = max(a_top, b_top)
-        inter_left = max(a_left, b_left)
-        inter_bottom = min(a_bottom, b_bottom)
-        inter_right = min(a_right, b_right)
-        inter_area = ClassroomAttendanceSystem._box_area(
-            inter_top, inter_right, inter_bottom, inter_left
-        )
-        if inter_area <= 0:
-            return False
-        a_area = ClassroomAttendanceSystem._box_area(a_top, a_right, a_bottom, a_left)
-        b_area = ClassroomAttendanceSystem._box_area(b_top, b_right, b_bottom, b_left)
-        union = a_area + b_area - inter_area
-        return union > 0 and (inter_area / union) >= 0.30
-
-    def _merge_face_locations(self, locations):
-        """Deduplicate overlapping detections, keeping the largest box."""
-        unique = []
-        for loc in sorted(locations, key=lambda box: self._box_area(*box), reverse=True):
-            if not any(self._boxes_overlap(loc, kept) for kept in unique):
-                unique.append(loc)
-        return unique
-
-    def _scale_locations(self, locations, scale):
-        if abs(scale - 1.0) < 1e-5:
-            return locations
-        return [
-            (int(round(top * scale)), int(round(right * scale)), int(round(bottom * scale)), int(round(left * scale)))
-            for top, right, bottom, left in locations
-        ]
 
     @staticmethod
     def _downscale_rgb(rgb_image, max_edge):
         h, w = rgb_image.shape[:2]
         longest = max(h, w)
         if longest <= max_edge:
-            return rgb_image, 1.0
+            return np.ascontiguousarray(rgb_image), 1.0
         scale = max_edge / float(longest)
         resized = cv2.resize(
             rgb_image,
             (int(round(w * scale)), int(round(h * scale))),
-            interpolation=cv2.INTER_AREA,
+            interpolation=cv2.INTER_LINEAR,
         )
-        return resized, scale
+        return np.ascontiguousarray(resized), scale
 
     def prepare_known_faces(self, db_encoding_rows=None, allowed_student_ids=None):
         self.known_face_encodings = []
@@ -297,100 +248,31 @@ class ClassroomAttendanceSystem:
             name = self.metadata.get(str(student_id), {}).get("name", f"Student {student_id}")
             self._register_encoding(filepath, student_id, name)
 
-    def _filter_face_locations(self, locations, img_h, img_w):
-        img_area = img_h * img_w
-        min_dim = max(18, int(min(img_h, img_w) * 0.015))
-        min_area = min_dim * min_dim * 0.5
-        max_area = img_area * 0.25
-
-        filtered = []
-        for top, right, bottom, left in locations:
-            top = max(0, int(top))
-            left = max(0, int(left))
-            bottom = min(img_h, int(bottom))
-            right = min(img_w, int(right))
-
-            height = bottom - top
-            width = right - left
-            if height < min_dim or width < min_dim * 0.6:
-                continue
-            area = height * width
-            if area < min_area or area > max_area:
-                continue
-            aspect = width / float(height)
-            if aspect < 0.5 or aspect > 1.8:
-                continue
-            filtered.append((top, right, bottom, left))
-        return filtered
-
     def _detect_face_locations(self, rgb_image):
-        """
-        High-accuracy detection for group photos:
-        Detects faces across full image and half-grid crops to catch distant/small faces.
-        """
+        """Clean, fast detection scaled correctly across the full group image."""
         h, w = rgb_image.shape[:2]
-        collected = []
+        detect_img, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
+        inv_scale = 1.0 / scale
 
-        # 1. Full image pass at high resolution
-        detect_img, det_scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE_LARGE)
-        inv_scale = 1.0 / det_scale
+        # Single pass with upsample=1 detects group faces accurately without CPU timeout
+        small_locations = face_recognition.face_locations(
+            detect_img, 
+            number_of_times_to_upsample=1, 
+            model="hog"
+        )
 
-        batch = face_recognition.face_locations(detect_img, number_of_times_to_upsample=1, model="hog")
-        collected.extend(self._scale_locations(batch, inv_scale))
+        full_locations = []
+        for top, right, bottom, left in small_locations:
+            orig_top = max(0, int(round(top * inv_scale)))
+            orig_right = min(w, int(round(right * inv_scale)))
+            orig_bottom = min(h, int(round(bottom * inv_scale)))
+            orig_left = max(0, int(round(left * inv_scale)))
 
-        # 2. Quadrant/Grid Scan for dense crowd detection (2x2 overlapping tiles)
-        # This gives high effective resolution for small faces without exhausting RAM
-        if max(h, w) > 1200:
-            tile_h, tile_w = int(h * 0.6), int(w * 0.6)
-            step_y, step_x = int(h * 0.4), int(w * 0.4)
+            if orig_bottom > orig_top + 15 and orig_right > orig_left + 15:
+                full_locations.append((orig_top, orig_right, orig_bottom, orig_left))
 
-            for y0 in range(0, h, step_y):
-                for x0 in range(0, w, step_x):
-                    y1 = min(h, y0 + tile_h)
-                    x1 = min(w, x0 + tile_w)
-                    crop = rgb_image[y0:y1, x0:x1]
-                    crop_small, crop_scale = self._downscale_rgb(crop, 1280)
-                    tile_inv = 1.0 / crop_scale
-
-                    tile_faces = face_recognition.face_locations(crop_small, number_of_times_to_upsample=1, model="hog")
-                    for top, right, bottom, left in tile_faces:
-                        orig_top = int(top * tile_inv) + y0
-                        orig_right = int(right * tile_inv) + x0
-                        orig_bottom = int(bottom * tile_inv) + y0
-                        orig_left = int(left * tile_inv) + x0
-                        collected.append((orig_top, orig_right, orig_bottom, left + x0))
-
-        merged = self._filter_face_locations(self._merge_face_locations(collected), h, w)
-        gc.collect()
-        print(f"Total valid faces detected: {len(merged)}")
-        return merged
-
-    def _encode_face_at_location(self, rgb_image, location):
-        top, right, bottom, left = location
-        h, w = rgb_image.shape[:2]
-        
-        # Add 10% padding around face box for better facial landmark/encoding quality
-        pad_y = int((bottom - top) * 0.1)
-        pad_x = int((right - left) * 0.1)
-        
-        c_top = max(0, top - pad_y)
-        c_left = max(0, left - pad_x)
-        c_bottom = min(h, bottom + pad_y)
-        c_right = min(w, right + pad_x)
-
-        crop = rgb_image[c_top:c_bottom, c_left:c_right]
-        if crop.shape[0] < 10 or crop.shape[1] < 10:
-            return None
-
-        # Detect landmark inside the cropped region
-        crop_loc = (pad_y, crop.shape[1] - pad_x, crop.shape[0] - pad_y, pad_x)
-        encodings = face_recognition.face_encodings(crop, [crop_loc], num_jitters=1)
-        if encodings:
-            return encodings[0]
-
-        # Fallback to direct location
-        encodings = face_recognition.face_encodings(rgb_image, [location], num_jitters=1)
-        return encodings[0] if encodings else None
+        print(f"Detected {len(full_locations)} face(s) in image.")
+        return full_locations
 
     def _assign_faces_to_students(
         self,
@@ -399,7 +281,7 @@ class ClassroomAttendanceSystem:
         allowed_set: set | None,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> dict[int, tuple[int | None, str, float]]:
-        candidates: list[tuple[int, int, str, float, float]] = []
+        candidates = []
 
         for face_index, encoding in face_encodings_by_index.items():
             if encoding is None or not self.known_face_encodings:
@@ -412,24 +294,16 @@ class ClassroomAttendanceSystem:
                 student_id = self.known_face_ids[idx]
                 if allowed_set is not None and student_id not in allowed_set:
                     continue
-                confidence = 1 - distance
+                confidence = 1.0 - distance
                 if confidence < min_confidence:
                     continue
-                candidates.append(
-                    (
-                        face_index,
-                        student_id,
-                        self.known_face_names[idx],
-                        confidence,
-                        distance,
-                    )
-                )
+                candidates.append((face_index, student_id, self.known_face_names[idx], confidence, distance))
 
         candidates.sort(key=lambda item: item[4])
 
-        assigned_faces: set[int] = set()
-        assigned_students: set[int] = set()
-        assignments: dict[int, tuple[int | None, str, float]] = {}
+        assigned_faces = set()
+        assigned_students = set()
+        assignments = {}
 
         for face_index, student_id, name, confidence, _distance in candidates:
             if face_index in assigned_faces or student_id in assigned_students:
@@ -465,20 +339,29 @@ class ClassroomAttendanceSystem:
                 sid for sid in allowed_set if sid in self.known_face_ids
             ]
 
-        print("Analyzing classroom image...")
-
         classroom_image = face_recognition.load_image_file(classroom_image_path)
+        classroom_image = np.ascontiguousarray(classroom_image)
         classroom_image_cv = cv2.cvtColor(classroom_image, cv2.COLOR_RGB2BGR)
 
         face_locations = self._detect_face_locations(classroom_image)
 
-        face_encodings_by_index: dict[int, np.ndarray | None] = {}
-        for face_index, location in enumerate(face_locations):
-            face_encodings_by_index[face_index] = self._encode_face_at_location(
-                classroom_image, location
-            )
+        # Batch encode all detected faces safely
+        face_encodings_by_index = {}
+        if face_locations:
+            try:
+                encodings = face_recognition.face_encodings(
+                    classroom_image, 
+                    known_face_locations=face_locations, 
+                    num_jitters=1
+                )
+                for idx, enc in enumerate(encodings):
+                    face_encodings_by_index[idx] = enc
+            except Exception as e:
+                print(f"Face encoding error: {e}")
+                for idx in range(len(face_locations)):
+                    face_encodings_by_index[idx] = None
 
-        assignments: dict[int, tuple[int | None, str, float]] = {}
+        assignments = {}
         if has_registered_faces:
             assignments = self._assign_faces_to_students(
                 face_encodings_by_index,
@@ -520,28 +403,26 @@ class ClassroomAttendanceSystem:
                 ),
             })
 
+            # Draw green for recognized, red for unknown
             color = (0, 255, 0) if student_id is not None else (0, 0, 255)
-            # Draw rectangle (left, top) -> (right, bottom)
             cv2.rectangle(classroom_image_cv, (left, top), (right, bottom), color, 3)
 
             label = f"{name} ({confidence:.0%})" if student_id is not None else "Unknown"
-            
-            # Label background header
-            label_y = max(top - 10, 25)
-            (w_txt, h_txt), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.6, 1)
+            label_y = max(top - 10, 20)
+            (w_txt, h_txt), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.55, 1)
             cv2.rectangle(
-                classroom_image_cv, 
-                (left, label_y - h_txt - 6), 
-                (left + w_txt + 8, label_y + 4), 
-                color, 
-                cv2.FILLED
+                classroom_image_cv,
+                (left, label_y - h_txt - 4),
+                (left + w_txt + 6, label_y + 4),
+                color,
+                cv2.FILLED,
             )
             cv2.putText(
                 classroom_image_cv,
                 label,
-                (left + 4, label_y - 2),
+                (left + 3, label_y - 2),
                 cv2.FONT_HERSHEY_DUPLEX,
-                0.6,
+                0.55,
                 (255, 255, 255),
                 1,
             )
