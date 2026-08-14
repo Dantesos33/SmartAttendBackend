@@ -340,13 +340,38 @@ class ClassroomAttendanceSystem:
                     crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
                 )
 
+            lm_h, lm_w = landmark_crop.shape[:2]
+
             landmarks = {}
             try:
-                lm = face_recognition.face_landmarks(landmark_crop, model="large")
+                # Tell the landmark predictor exactly where the face is (the
+                # whole crop) instead of letting it re-run its own face
+                # detector on the crop first. Re-detection is what fails on
+                # masked/niqab faces — with much of the face covered, the
+                # internal detector often can't confirm a face is there at
+                # all, which was wrongly dropping legitimate masked faces as
+                # "insufficient". Stage-1 already found this face; we only
+                # need landmarks within that known region.
+                lm = face_recognition.face_landmarks(
+                    landmark_crop,
+                    face_locations=[(0, lm_w, lm_h, 0)],
+                    model="large",
+                )
                 if lm:
                     landmarks = lm[0]
             except Exception:
                 landmarks = {}
+
+            # Fall back to the predictor's own detection if forcing the full
+            # crop as the face location produced nothing (e.g. a very loose
+            # detection box with a lot of background margin).
+            if not landmarks:
+                try:
+                    lm = face_recognition.face_landmarks(landmark_crop, model="large")
+                    if lm:
+                        landmarks = lm[0]
+                except Exception:
+                    landmarks = {}
 
             eyes = bool(landmarks.get("left_eye")) or bool(landmarks.get("right_eye"))
             mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
