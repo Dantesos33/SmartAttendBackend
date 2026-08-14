@@ -1,6 +1,5 @@
 import os
 import shutil
-import uuid
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from sqlalchemy.orm import Session
@@ -88,86 +87,78 @@ async def register_student(
 @router.post("/recognize")
 async def recognize_classroom(
     file: UploadFile = File(...),
-    section_id: int | None = Form(None),
+    section_id: int = Form(...),
     tolerance: float = Form(0.65),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
     """Raw AI output only — this does NOT save attendance."""
     try:
-        allowed_student_ids = None
-        if section_id is not None:
-            section = get_section_with_class(db, section_id)
-            if not section:
-                raise HTTPException(status_code=404, detail="Section not found.")
-            if (
-                current_user.role == UserRole.teacher
-                and section.class_.teacher_id != current_user.id
-            ):
-                raise HTTPException(status_code=403, detail="You don't own this section's class.")
-            allowed_student_ids = [
-                row.student_id
-                for row in db.query(Enrollment.student_id)
-                .filter(Enrollment.section_id == section_id)
-                .all()
-            ]
+        # Attendance recognition is ALWAYS scoped to the selected section.
+        # Never load/compare against the whole class or global student database.
+        section = get_section_with_class(db, section_id)
+        if not section:
+            raise HTTPException(status_code=404, detail="Section not found.")
+        if (
+            current_user.role == UserRole.teacher
+            and section.class_.teacher_id != current_user.id
+        ):
+            raise HTTPException(status_code=403, detail="You don't own this section's class.")
+
+        allowed_student_ids = [
+            row.student_id
+            for row in db.query(Enrollment.student_id)
+            .filter(Enrollment.section_id == section.id)
+            .all()
+        ]
 
         # Students may have avatar_url from before encodings were stored in the DB.
         # Rebuild embeddings from any profile photos still on disk.
-        if allowed_student_ids is not None:
-            sync_student_encodings(db, attendance_system, allowed_student_ids)
-        else:
-            sync_student_encodings(db, attendance_system)
+        sync_student_encodings(db, attendance_system, allowed_student_ids)
 
         encoding_query = db.query(User.id, User.name, User.face_encoding_json).filter(
             User.face_encoding_json.isnot(None),
             User.role == UserRole.student,
         )
-        if allowed_student_ids is not None:
-            if allowed_student_ids:
-                encoding_query = encoding_query.filter(User.id.in_(allowed_student_ids))
-            else:
-                encoding_query = encoding_query.filter(User.id == -1)
+        if allowed_student_ids:
+            encoding_query = encoding_query.filter(User.id.in_(allowed_student_ids))
+        else:
+            encoding_query = encoding_query.filter(User.id == -1)
         db_encoding_rows = encoding_query.all()
 
         os.makedirs("temp", exist_ok=True)
-        # Unique temporary names prevent repeated captures from reusing an old
-        # image when the frontend sends the same filename again.
-        suffix = os.path.splitext(file.filename or "capture.jpg")[1].lower() or ".jpg"
-        temp_path = os.path.join("temp", f"attendance_{uuid.uuid4().hex}{suffix}")
+        temp_path = f"temp/{file.filename}"
 
-        try:
-            with open(temp_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-            attendance_data, message = attendance_system.recognize_classroom(
-                temp_path,
-                tolerance=tolerance,
-                allowed_student_ids=allowed_student_ids,
-                db_encoding_rows=db_encoding_rows,
+        attendance_data, message = attendance_system.recognize_classroom(
+            temp_path,
+            tolerance=tolerance,
+            allowed_student_ids=allowed_student_ids,
+            db_encoding_rows=db_encoding_rows,
+        )
+
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        if not attendance_data:
+            raise HTTPException(status_code=400, detail=message)
+
+        missing = students_missing_face_data(db, allowed_student_ids)
+        attendance_data["section_id"] = section.id
+        attendance_data["section_name"] = section.name
+        attendance_data["class_id"] = section.class_id
+        attendance_data["students_missing_face_data"] = missing
+        if missing and not attendance_data.get("recognition_available"):
+            names = ", ".join(item["name"] for item in missing[:5])
+            extra = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+            attendance_data["warning_message"] = (
+                "These enrolled students need to re-upload their profile photo "
+                f"so face recognition can work: {names}{extra}."
             )
 
-            if not attendance_data:
-                raise HTTPException(status_code=400, detail=message)
-
-            if allowed_student_ids is not None:
-                missing = students_missing_face_data(db, allowed_student_ids)
-                attendance_data["students_missing_face_data"] = missing
-                if missing and not attendance_data.get("recognition_available"):
-                    names = ", ".join(item["name"] for item in missing[:5])
-                    extra = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
-                    attendance_data["warning_message"] = (
-                        "These enrolled students need to re-upload their profile photo "
-                        f"so face recognition can work: {names}{extra}."
-                    )
-
-            return {"status": "success", "message": message, "data": attendance_data}
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
+        return {"status": "success", "message": message, "data": attendance_data}
 
     except HTTPException:
         raise

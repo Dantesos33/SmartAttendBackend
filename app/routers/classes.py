@@ -321,6 +321,48 @@ def class_roster(
     return result
 
 
+@router.get("/sections/{section_id}/roster")
+def section_roster(
+    section_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return only the students enrolled in one section. Attendance screens
+    should use this endpoint instead of loading the entire class roster."""
+    section = (
+        db.query(Section)
+        .options(joinedload(Section.class_))
+        .filter(Section.id == section_id)
+        .first()
+    )
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found.")
+    if current_user.role == UserRole.teacher and section.class_.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You don't have access to this section.")
+    if current_user.role == UserRole.student:
+        raise HTTPException(status_code=403, detail="Not available to students.")
+
+    enrollments = (
+        db.query(Enrollment)
+        .options(joinedload(Enrollment.student))
+        .filter(Enrollment.section_id == section.id)
+        .all()
+    )
+    return {
+        "section_id": section.id,
+        "section_name": section.name,
+        "students": [
+            {
+                "id": e.student.id,
+                "name": e.student.name,
+                "email": e.student.email,
+                "avatar_url": e.student.avatar_url,
+            }
+            for e in enrollments
+        ],
+    }
+
+
 @router.get("/{class_id}", response_model=ClassOut)
 def get_class(
     class_id: int,
