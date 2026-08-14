@@ -10,6 +10,11 @@ import json
 MIN_CONFIDENCE = 0.45
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
+# A second, higher-sensitivity HOG pass is used when the first pass may have
+# missed smaller/background faces in group photos. Keeping this pass on a
+# smaller image prevents the upsample=2 operation from becoming excessive.
+SECOND_PASS_DETECT_EDGE = 1000
+SECOND_PASS_UPSAMPLE = 2
 
 
 class ClassroomAttendanceSystem:
@@ -248,29 +253,114 @@ class ClassroomAttendanceSystem:
             name = self.metadata.get(str(student_id), {}).get("name", f"Student {student_id}")
             self._register_encoding(filepath, student_id, name)
 
+    @staticmethod
+    def _box_iou(a, b):
+        at, ar, ab, al = a
+        bt, br, bb, bl = b
+        top = max(at, bt)
+        left = max(al, bl)
+        bottom = min(ab, bb)
+        right = min(ar, br)
+        inter_w = max(0, right - left)
+        inter_h = max(0, bottom - top)
+        inter = inter_w * inter_h
+        if inter == 0:
+            return 0.0
+        area_a = max(0, ar - al) * max(0, ab - at)
+        area_b = max(0, br - bl) * max(0, bb - bt)
+        union = area_a + area_b - inter
+        return inter / union if union else 0.0
+
+    def _scale_locations_to_original(self, locations, scale, width, height):
+        inv_scale = 1.0 / scale
+        result = []
+        for top, right, bottom, left in locations:
+            orig_top = max(0, int(round(top * inv_scale)))
+            orig_right = min(width, int(round(right * inv_scale)))
+            orig_bottom = min(height, int(round(bottom * inv_scale)))
+            orig_left = max(0, int(round(left * inv_scale)))
+            if orig_bottom > orig_top + 15 and orig_right > orig_left + 15:
+                result.append((orig_top, orig_right, orig_bottom, orig_left))
+        return result
+
     def _detect_face_locations(self, rgb_image):
-        """Clean, fast detection scaled correctly across the full group image."""
+        """Detect faces reliably in group photos, including smaller/background faces.
+
+        The normal HOG pass is kept as the fast path. If it returns a small number
+        of faces, a second upsampled pass is run on a smaller copy of the image.
+        Detections are merged by IoU so the same face is never returned twice.
+        """
         h, w = rgb_image.shape[:2]
         detect_img, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
-        inv_scale = 1.0 / scale
-
-        # Single pass with upsample=1 detects group faces accurately without CPU timeout
-        small_locations = face_recognition.face_locations(
-            detect_img, 
-            number_of_times_to_upsample=1, 
-            model="hog"
+        primary = face_recognition.face_locations(
+            detect_img,
+            number_of_times_to_upsample=1,
+            model="hog",
+        )
+        full_locations = self._scale_locations_to_original(
+            primary, scale, w, h
         )
 
-        full_locations = []
-        for top, right, bottom, left in small_locations:
-            orig_top = max(0, int(round(top * inv_scale)))
-            orig_right = min(w, int(round(right * inv_scale)))
-            orig_bottom = min(h, int(round(bottom * inv_scale)))
-            orig_left = max(0, int(round(left * inv_scale)))
+        # Three-person detection in a larger group is a common failure mode: the
+        # smaller/further-away face is often missed by the first HOG pass.
+        # Re-run only when the result is likely incomplete, keeping normal captures fast.
+        if len(full_locations) < 6:
+            sensitive_img, sensitive_scale = self._downscale_rgb(
+                rgb_image, SECOND_PASS_DETECT_EDGE
+            )
+            try:
+                secondary = face_recognition.face_locations(
+                    sensitive_img,
+                    number_of_times_to_upsample=SECOND_PASS_UPSAMPLE,
+                    model="hog",
+                )
+                secondary_full = self._scale_locations_to_original(
+                    secondary, sensitive_scale, w, h
+                )
+                for box in secondary_full:
+                    if not any(self._box_iou(box, existing) >= 0.35 for existing in full_locations):
+                        full_locations.append(box)
+            except Exception as e:
+                # The first pass is still a valid result if the more expensive
+                # sensitivity pass cannot run.
+                print(f"Secondary face detection skipped: {e}")
 
-            if orig_bottom > orig_top + 15 and orig_right > orig_left + 15:
-                full_locations.append((orig_top, orig_right, orig_bottom, orig_left))
+        # OpenCV's lightweight frontal-face detector is a final safety net for
+        # the occasional small face that HOG still misses. It is only used when
+        # fewer than four faces were found, and candidates are restricted to a
+        # plausible upper-image face region to avoid adding body/background boxes.
+        if len(full_locations) < 4:
+            try:
+                gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+                cascade = cv2.CascadeClassifier(
+                    os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+                )
+                haar_boxes = cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.08,
+                    minNeighbors=5,
+                    minSize=(40, 40),
+                )
+                for x, y, box_w, box_h in haar_boxes:
+                    # Ignore obvious lower-body false positives; real classroom
+                    # faces in this capture are in the upper part of the image.
+                    center_y = y + box_h / 2.0
+                    if (
+                        center_y > h * 0.65
+                        or box_w < 40
+                        or box_h < 40
+                        or max(box_w, box_h) > 180
+                    ):
+                        continue
+                    box = (y, x + box_w, y + box_h, x)
+                    if not any(self._box_iou(box, existing) >= 0.25 for existing in full_locations):
+                        full_locations.append(box)
+            except Exception as e:
+                print(f"OpenCV face-detection fallback skipped: {e}")
 
+        # Stable top-to-bottom/left-to-right order makes face indices predictable
+        # and keeps the UI from jumping when two detection passes are merged.
+        full_locations.sort(key=lambda box: (box[0], box[3]))
         print(f"Detected {len(full_locations)} face(s) in image.")
         return full_locations
 

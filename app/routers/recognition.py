@@ -1,5 +1,6 @@
 import os
 import shutil
+import uuid
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from sqlalchemy.orm import Session
@@ -130,20 +131,24 @@ async def recognize_classroom(
         db_encoding_rows = encoding_query.all()
 
         os.makedirs("temp", exist_ok=True)
-        temp_path = f"temp/{file.filename}"
+        # Never reuse the uploaded filename: repeated captures can otherwise race
+        # over the same temp file and make a new request appear to process an old photo.
+        suffix = os.path.splitext(file.filename or "classroom.jpg")[1] or ".jpg"
+        temp_path = os.path.join("temp", f"recognize_{uuid.uuid4().hex}{suffix}")
 
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        try:
+            with open(temp_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
 
-        attendance_data, message = attendance_system.recognize_classroom(
-            temp_path,
-            tolerance=tolerance,
-            allowed_student_ids=allowed_student_ids,
-            db_encoding_rows=db_encoding_rows,
-        )
-
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+            attendance_data, message = attendance_system.recognize_classroom(
+                temp_path,
+                tolerance=tolerance,
+                allowed_student_ids=allowed_student_ids,
+                db_encoding_rows=db_encoding_rows,
+            )
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
         if not attendance_data:
             raise HTTPException(status_code=400, detail=message)
