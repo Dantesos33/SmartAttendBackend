@@ -8,7 +8,7 @@ from datetime import datetime
 import json
 
 MIN_CONFIDENCE = 0.45
-MAX_DETECT_EDGE = 2000
+MAX_DETECT_EDGE = 1600
 MAX_ANNOTATED_EDGE = 1200
 
 
@@ -190,7 +190,7 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
-    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=96):
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=94):
         """Return a high-quality, padded profile crop suitable for student enrollment.
 
         Detection boxes around distant students can be only a few dozen pixels wide.
@@ -249,7 +249,7 @@ class ClassroomAttendanceSystem:
             crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
 
             # Always provide enough pixels for a usable profile photo.
-            target = 640
+            target = 512
             if crop_bgr.shape[0] != target or crop_bgr.shape[1] != target:
                 crop_bgr = cv2.resize(
                     crop_bgr,
@@ -337,85 +337,41 @@ class ClassroomAttendanceSystem:
     @staticmethod
     def _scale_locations(locations, scale, width, height):
         inv = 1.0 / scale
-        result = []
-        for top, right, bottom, left in locations:
-            result.append((
+        return [
+            (
                 max(0, int(round(top * inv))),
                 min(width, int(round(right * inv))),
                 min(height, int(round(bottom * inv))),
                 max(0, int(round(left * inv))),
-            ))
-        return result
-
-    @staticmethod
-    def _rotate_image(rgb_image, angle):
-        if angle == 90:
-            return np.ascontiguousarray(cv2.rotate(rgb_image, cv2.ROTATE_90_CLOCKWISE))
-        if angle == -90:
-            return np.ascontiguousarray(cv2.rotate(rgb_image, cv2.ROTATE_90_COUNTERCLOCKWISE))
-        if angle == 180:
-            return np.ascontiguousarray(cv2.rotate(rgb_image, cv2.ROTATE_180))
-        return np.ascontiguousarray(rgb_image)
-
-    @staticmethod
-    def _map_rotated_location(location, angle, original_shape):
-        """Map a dlib/face_recognition box from a rotated image back to original."""
-        top, right, bottom, left = location
-        h, w = original_shape[:2]
-
-        # Convert the four corners through the inverse rotation.
-        corners = np.array([
-            [left, top], [right, top], [right, bottom], [left, bottom]
-        ], dtype=np.float32)
-
-        if angle == 90:
-            # rotated image is h? x w? for clockwise rotation: (x',y')=(h-y,x)
-            mapped = np.column_stack((corners[:, 1], h - corners[:, 0]))
-        elif angle == -90:
-            # counter-clockwise: (x',y')=(y,w-x)
-            mapped = np.column_stack((w - corners[:, 1], corners[:, 0]))
-        elif angle == 180:
-            mapped = np.column_stack((w - corners[:, 0], h - corners[:, 1]))
-        else:
-            mapped = corners
-
-        xs = mapped[:, 0]
-        ys = mapped[:, 1]
-        return (
-            max(0, int(np.floor(ys.min()))),
-            min(w, int(np.ceil(xs.max()))),
-            min(h, int(np.ceil(ys.max()))),
-            max(0, int(np.floor(xs.min()))),
-        )
+            )
+            for top, right, bottom, left in locations
+        ]
 
     def _detect_face_locations(self, rgb_image):
-        """High-recall face detection without replacing the reliable baseline.
+        """Memory-safe high-recall detector.
 
-        The original HOG detector remains the first pass. If it misses people,
-        a second HOG pass with upsample=3 is run on the original-size image.
-        That is important for small faces near the edges: on the supplied
-        1200x900 photo, this pass detects all four people.
-
-        Profile/rotated passes are only used when the normal passes still miss
-        faces, so normal attendance photos stay reasonably fast.
+        The normal HOG pass runs first. If it misses faces, detection is retried
+        on small overlapping tiles with upsample=2. Tiling is intentional: a
+        full-image upsample=3 pass can consume hundreds of MB on Railway for a
+        single classroom photo. Tiles give the detector more pixels around small
+        faces without creating one enormous dlib image pyramid.
         """
         h, w = rgb_image.shape[:2]
         detections = []
 
-        def add(box, iou=0.35):
+        def add(box, iou=0.30):
             top, right, bottom, left = [int(v) for v in box]
             top = max(0, min(h - 1, top))
             left = max(0, min(w - 1, left))
             bottom = max(top + 1, min(h, bottom))
             right = max(left + 1, min(w, right))
-            if bottom - top < 24 or right - left < 24:
+            if bottom - top < 20 or right - left < 20:
                 return
-            if not any(self._box_iou((top, right, bottom, left), x) >= iou for x in detections):
-                detections.append((top, right, bottom, left))
+            candidate = (top, right, bottom, left)
+            if not any(self._box_iou(candidate, x) >= iou for x in detections):
+                detections.append(candidate)
 
         detect_img, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
-
-        # Reliable baseline.
         try:
             locations = face_recognition.face_locations(
                 detect_img, number_of_times_to_upsample=1, model="hog"
@@ -424,54 +380,65 @@ class ClassroomAttendanceSystem:
                 add(box)
         except Exception as e:
             print(f"Primary face detection failed: {e}")
+        finally:
+            del detect_img
 
-        # Critical small-face recovery. dlib's detector needs a larger upsample
-        # factor for the fourth face in the supplied image.
+        # Small-face recovery. Use overlapping tiles instead of upsample=3 on the
+        # entire image. At most one tile is held by dlib at a time.
         if len(detections) < 4:
+            tile_max = 900
+            overlap = 0.28
+            step = max(1, int(tile_max * (1.0 - overlap)))
+            ys = list(range(0, max(1, h - tile_max + 1), step))
+            xs = list(range(0, max(1, w - tile_max + 1), step))
+            if not ys or ys[-1] != max(0, h - tile_max):
+                ys.append(max(0, h - tile_max))
+            if not xs or xs[-1] != max(0, w - tile_max):
+                xs.append(max(0, w - tile_max))
+
+            for y0 in ys:
+                for x0 in xs:
+                    y1 = min(h, y0 + tile_max)
+                    x1 = min(w, x0 + tile_max)
+                    tile = np.ascontiguousarray(rgb_image[y0:y1, x0:x1])
+                    try:
+                        locations = face_recognition.face_locations(
+                            tile, number_of_times_to_upsample=2, model="hog"
+                        )
+                        for top, right, bottom, left in locations:
+                            add((top + y0, right + x0, bottom + y0, left + x0))
+                    except Exception as e:
+                        print(f"Tile face detection failed at ({x0},{y0}): {e}")
+                    finally:
+                        del tile
+                    if len(detections) >= 4:
+                        break
+                if len(detections) >= 4:
+                    break
+
+        # Profile fallback uses a downscaled grayscale copy, not the full RGB
+        # image. This is substantially cheaper than rotating the whole image.
+        if len(detections) < 4:
+            profile_img, profile_scale = self._downscale_rgb(rgb_image, 1400)
+            gray = None
             try:
-                locations = face_recognition.face_locations(
-                    rgb_image, number_of_times_to_upsample=3, model="hog"
+                gray = cv2.cvtColor(profile_img, cv2.COLOR_RGB2GRAY)
+                cascade = cv2.CascadeClassifier(
+                    os.path.join(cv2.data.haarcascades, "haarcascade_profileface.xml")
                 )
-                for box in locations:
-                    add(box, iou=0.30)
-                print(f"High-recall HOG pass found {len(locations)} candidate(s).")
-            except Exception as e:
-                print(f"High-recall HOG pass failed: {e}")
-
-        # Profile detector for people looking sideways. This is a detection
-        # fallback only; recognition still decides whether the person is known.
-        if len(detections) < 4:
-            try:
-                gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
-                gray = cv2.equalizeHist(gray)
-                for filename in (
-                    "haarcascade_profileface.xml",
-                    "haarcascade_frontalface_alt2.xml",
-                ):
-                    cascade = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, filename))
-                    if cascade.empty():
-                        continue
+                if not cascade.empty():
                     boxes = cascade.detectMultiScale(
-                        gray, scaleFactor=1.05, minNeighbors=4, minSize=(28, 28)
+                        gray, scaleFactor=1.08, minNeighbors=5, minSize=(24, 24)
                     )
                     for x, y, bw, bh in boxes:
-                        if bw <= w * 0.30 and bh <= h * 0.30:
-                            add((y, x + bw, y + bh, x), iou=0.25)
+                        add(tuple(self._scale_locations(
+                            [(y, x + bw, y + bh, x)], profile_scale, w, h
+                        )[0]), iou=0.25)
             except Exception as e:
                 print(f"Profile fallback failed: {e}")
-
-        # Rotated HOG fallback catches strongly tilted/downward/sideways faces.
-        if len(detections) < 4:
-            for angle in (90, -90, 180):
-                try:
-                    rotated = self._rotate_image(rgb_image, angle)
-                    locations = face_recognition.face_locations(
-                        rotated, number_of_times_to_upsample=2, model="hog"
-                    )
-                    for box in locations:
-                        add(self._map_rotated_location(box, angle, rgb_image.shape), iou=0.25)
-                except Exception as e:
-                    print(f"Rotated detection {angle} failed: {e}")
+            finally:
+                del gray
+                del profile_img
 
         detections.sort(key=lambda b: (b[0], b[3]))
         print(f"Detected {len(detections)} face(s) in image.")
