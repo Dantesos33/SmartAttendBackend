@@ -179,15 +179,19 @@ def check_faces_stage(
     results = []
     for i, loc in enumerate(face_locations):
         top, right, bottom, left = loc
-        status = attendance_system.classify_face_occlusion(rgb, loc)
         encoding = None
-        if status == "clear":
-            try:
-                encs = face_recognition.face_encodings(rgb, known_face_locations=[loc], num_jitters=1)
-                if encs:
-                    encoding = [float(x) for x in encs[0]]
-            except Exception as exc:
-                print(f"Face encoding failed for face {i}: {exc}")
+        try:
+            encs = face_recognition.face_encodings(rgb, known_face_locations=[loc], num_jitters=1)
+            if encs:
+                encoding = [float(x) for x in encs[0]]
+        except Exception as exc:
+            print(f"Face encoding failed for face {i}: {exc}")
+
+        # Detection is already complete. A face that cannot be encoded is kept
+        # as masked/occluded rather than being dropped from attendance.
+        status = attendance_system.classify_face_occlusion(
+            rgb, loc, encoding_available=encoding is not None
+        )
         crop = attendance_system._encode_rgb_crop_base64(rgb, top, right, bottom, left, quality=96, padded=True)
         results.append({
             "face_index": i, "face_status": status,
@@ -202,7 +206,7 @@ def check_faces_stage(
 @router.post("/recognize/check-enrollment")
 def check_enrollment_stage(
     job_id: str = Form(...),
-    tolerance: float = Form(0.65),
+    tolerance: float = Form(0.55),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
@@ -214,30 +218,44 @@ def check_enrollment_stage(
     rows = db.query(User.id, User.name, User.face_encoding_json).filter(User.id.in_(allowed_student_ids), User.role == UserRole.student).all() if allowed_student_ids else []
     attendance_system.prepare_known_faces(db_encoding_rows=rows, allowed_student_ids=allowed_student_ids)
     allowed_set = set(allowed_student_ids)
+
+    # Match all clear faces globally, not one face at a time. This prevents the
+    # same enrolled student from being assigned to multiple detected faces and
+    # prevents a loose threshold from marking unrelated people present.
+    clear_encodings = {
+        int(face["face_index"]): np.array(face["encoding"], dtype=np.float64)
+        for face in job["faces"]
+        if face["face_status"] == "clear" and face.get("encoding")
+    }
+    assignments = attendance_system._assign_faces_to_students(
+        clear_encodings,
+        tolerance=float(tolerance),
+        allowed_set=allowed_set,
+        min_confidence=0.50,
+    )
+
     present_ids = []
     final_faces = []
     for face in job["faces"]:
+        face_index = int(face["face_index"])
         student_id = None
         name = "Unrecognized"
         confidence = 0.0
-        if face["face_status"] == "masked":
+        status = face["face_status"]
+
+        if status == "masked":
             name = "Masked"
-        elif face.get("encoding") and attendance_system.known_face_encodings:
-            enc = np.array(face["encoding"], dtype=np.float64)
-            distances = face_recognition.face_distance(attendance_system.known_face_encodings, enc)
-            if len(distances):
-                idx = int(np.argmin(distances))
-                distance = float(distances[idx])
-                if distance <= tolerance and attendance_system.known_face_ids[idx] in allowed_set:
-                    student_id = attendance_system.known_face_ids[idx]
-                    name = attendance_system.known_face_names[idx]
-                    confidence = 1.0 - distance
-                    if student_id not in present_ids:
-                        present_ids.append(student_id)
+        elif face_index in assignments:
+            student_id, name, confidence = assignments[face_index]
+            if student_id is None:
+                name = "Unrecognized"
+            elif student_id not in present_ids:
+                present_ids.append(student_id)
+
         final_faces.append({
-            "face_index": face["face_index"], "student_id": student_id, "name": name,
-            "confidence": confidence, "face_status": face["face_status"],
-            "attendance_status": "masked" if face["face_status"] == "masked" else ("present" if student_id else "unrecognized"),
+            "face_index": face_index, "student_id": student_id, "name": name,
+            "confidence": float(confidence), "face_status": status,
+            "attendance_status": "masked" if status == "masked" else ("present" if student_id else "unrecognized"),
             "location": face["location"], "crop_base64": face.get("crop_base64"),
         })
     absent_ids = [sid for sid in allowed_student_ids if sid not in present_ids]
@@ -253,6 +271,7 @@ def check_enrollment_stage(
         cv2.rectangle(annotated,(left,y-th-4),(left+tw+6,y+4),color,cv2.FILLED)
         cv2.putText(annotated,label,(left+3,y-2),cv2.FONT_HERSHEY_DUPLEX,.55,(255,255,255),1)
     annotated_b64 = attendance_system._encode_bgr_jpeg_base64(annotated, quality=88, max_edge=1200)
+    missing = students_missing_face_data(db, allowed_student_ids)
     result = {
         "section_id": section.id, "faces_detected": len(final_faces), "present_student_ids": present_ids,
         "absent_student_ids": absent_ids, "present_count": len(present_ids), "absent_count": len(absent_ids),
@@ -260,7 +279,15 @@ def check_enrollment_stage(
         "unknown_faces": sum(1 for f in final_faces if f["attendance_status"] == "unrecognized"),
         "face_details": final_faces, "annotated_image_base64": annotated_b64,
         "enrolled_with_face_photos": len(attendance_system.known_face_ids), "recognition_available": bool(attendance_system.known_face_encodings),
+        "students_missing_face_data": missing,
     }
+    if missing and not result["recognition_available"]:
+        names = ", ".join(item["name"] for item in missing[:5])
+        extra = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+        result["warning_message"] = (
+            "These enrolled students need to re-upload their profile photo "
+            f"so face recognition can work: {names}{extra}."
+        )
     job["stage"] = "complete"; job["result"] = result; _save_job(job_id, job)
     response = {"status":"success", "job_id":job_id, "stage":"complete", "data":result}
     _cleanup_job(job_id)
@@ -270,7 +297,7 @@ def check_enrollment_stage(
 async def recognize_classroom(
     file: UploadFile = File(...),
     section_id: int = Form(...),
-    tolerance: float = Form(0.65),
+    tolerance: float = Form(0.55),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):

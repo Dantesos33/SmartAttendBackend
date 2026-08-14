@@ -6,10 +6,14 @@ import base64
 import gc
 from datetime import datetime
 import json
+import urllib.request
+import threading
 
 MIN_CONFIDENCE = 0.45
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
+YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
+YUNET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
 
 
 class ClassroomAttendanceSystem:
@@ -24,6 +28,8 @@ class ClassroomAttendanceSystem:
         os.makedirs(self.known_students_dir, exist_ok=True)
         self.metadata = self._load_json(self.metadata_path, {})
         self.sessions = self._load_json(self.sessions_path, [])
+        self._yunet_detector = None
+        self._yunet_lock = threading.Lock()
         self.load_known_students_from_dir()
 
     def _load_json(self, path, default):
@@ -231,6 +237,64 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
+    def _get_yunet_detector(self, input_size):
+        """Return a lightweight YuNet detector. The model is downloaded once if absent.
+
+        YuNet is used instead of Haar Cascade because some Railway OpenCV builds do
+        not expose CascadeClassifier. It is also substantially better for small,
+        partially occluded and non-frontal faces.
+        """
+        if not hasattr(cv2, "FaceDetectorYN"):
+            return None
+        os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True)
+        if not os.path.exists(YUNET_MODEL_PATH):
+            tmp = YUNET_MODEL_PATH + ".download"
+            try:
+                with self._yunet_lock:
+                    if not os.path.exists(YUNET_MODEL_PATH):
+                        print("Downloading YuNet face detector model...")
+                        urllib.request.urlretrieve(YUNET_MODEL_URL, tmp)
+                        os.replace(tmp, YUNET_MODEL_PATH)
+            except Exception as exc:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                print(f"YuNet model download failed: {exc}")
+                return None
+        try:
+            detector = cv2.FaceDetectorYN.create(
+                YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
+                0.35, 0.30, 5000
+            )
+            return detector
+        except Exception as exc:
+            print(f"YuNet initialization failed: {exc}")
+            return None
+
+    def _yunet_locations(self, bgr_image):
+        h, w = bgr_image.shape[:2]
+        detector = self._get_yunet_detector((w, h))
+        if detector is None:
+            return []
+        try:
+            detector.setInputSize((w, h))
+            _, detections = detector.detect(bgr_image)
+            if detections is None:
+                return []
+            results = []
+            for row in detections:
+                x, y, bw, bh, score = [float(v) for v in row[:5]]
+                if score < 0.35 or bw < 10 or bh < 10:
+                    continue
+                results.append((int(y), int(x+bw), int(y+bh), int(x)))
+            return results
+        except Exception as exc:
+            print(f"YuNet detection failed: {exc}")
+            return []
+
+
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
         """Stage-2 occlusion classifier.
 
@@ -372,6 +436,23 @@ class ClassroomAttendanceSystem:
 
         if db_encoding_rows:
             self.load_db_encodings(db_encoding_rows)
+
+        # Recognition identity is one student, not one database encoding row.
+        # Collapse duplicate rows for the same student so a student can never
+        # appear multiple times in the candidate pool.
+        seen = set()
+        dedup_encodings, dedup_ids, dedup_names = [], [], []
+        for enc, sid, name in zip(self.known_face_encodings, self.known_face_ids, self.known_face_names):
+            sid = int(sid)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            dedup_encodings.append(enc)
+            dedup_ids.append(sid)
+            dedup_names.append(name)
+        self.known_face_encodings = dedup_encodings
+        self.known_face_ids = dedup_ids
+        self.known_face_names = dedup_names
 
         target_ids = allowed_student_ids
         if target_ids is None:
@@ -570,47 +651,74 @@ class ClassroomAttendanceSystem:
         allowed_set: set | None,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> dict[int, tuple[int | None, str, float]]:
-        candidates = []
-
+        # Build one candidate per (face, student), using the best distance if
+        # the database contains multiple encodings for the same student.
+        student_best = {}
         for face_index, encoding in face_encodings_by_index.items():
             if encoding is None or not self.known_face_encodings:
                 continue
             distances = face_recognition.face_distance(self.known_face_encodings, encoding)
-            for idx in np.argsort(distances):
-                distance = float(distances[idx])
-                if distance > tolerance:
-                    break
-                student_id = self.known_face_ids[idx]
-                if allowed_set is not None and student_id not in allowed_set:
+            per_student = {}
+            for idx, raw_distance in enumerate(distances):
+                sid = int(self.known_face_ids[idx])
+                if allowed_set is not None and sid not in allowed_set:
                     continue
-                confidence = 1.0 - distance
+                distance = float(raw_distance)
+                if distance < per_student.get(sid, float("inf")):
+                    per_student[sid] = distance
+            for sid, distance in per_student.items():
+                if distance > tolerance:
+                    continue
+                confidence = max(0.0, 1.0 - distance)
                 if confidence < min_confidence:
                     continue
-                candidates.append((face_index, student_id, self.known_face_names[idx], confidence, distance))
+                idx = self.known_face_ids.index(sid)
+                student_best[(face_index, sid)] = (distance, self.known_face_names[idx], confidence)
 
-        candidates.sort(key=lambda item: item[4])
+        # A loose match is dangerous in classroom photos. Require the best
+        # student to be meaningfully better than the next-best candidate for
+        # that face when there is ambiguity.
+        candidates = []
+        for face_index in face_encodings_by_index:
+            options = [
+                (dist, sid, name, conf)
+                for (fi, sid), (dist, name, conf) in student_best.items()
+                if fi == face_index
+            ]
+            options.sort(key=lambda x: x[0])
+            if not options:
+                continue
+            best = options[0]
+            if len(options) > 1:
+                margin = options[1][0] - best[0]
+                # Only reject ambiguous matches; don't penalize a strong close
+                # match simply because another student is somewhat nearby.
+                if best[0] > 0.48 and margin < 0.055:
+                    continue
+            dist, sid, name, conf = best
+            candidates.append((dist, face_index, sid, name, conf))
 
+        # Global one-to-one assignment: each face and each student can be used
+        # at most once.
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        assignments = {}
         assigned_faces = set()
         assigned_students = set()
-        assignments = {}
-
-        for face_index, student_id, name, confidence, _distance in candidates:
-            if face_index in assigned_faces or student_id in assigned_students:
+        for dist, face_index, sid, name, conf in candidates:
+            if face_index in assigned_faces or sid in assigned_students:
                 continue
-            assignments[face_index] = (student_id, name, confidence)
+            assignments[face_index] = (sid, name, conf)
             assigned_faces.add(face_index)
-            assigned_students.add(student_id)
+            assigned_students.add(sid)
 
         for face_index in face_encodings_by_index:
-            if face_index not in assignments:
-                assignments[face_index] = (None, "Unknown", 0.0)
-
+            assignments.setdefault(face_index, (None, "Unknown", 0.0))
         return assignments
 
     def recognize_classroom(
         self,
         classroom_image_path,
-        tolerance=0.55,
+        tolerance=0.50,
         allowed_student_ids=None,
         db_encoding_rows=None,
     ):
