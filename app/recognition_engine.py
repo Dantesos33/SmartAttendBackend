@@ -323,12 +323,12 @@ class ClassroomAttendanceSystem:
         top, left = max(0, top), max(0, left)
         bottom, right = min(h, bottom), min(w, right)
         if bottom <= top or right <= left:
-            return "clear"
+            return "insufficient"
 
         crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
         ch, cw = crop.shape[:2]
-        if ch < 24 or cw < 24:
-            return "clear"
+        if ch < 10 or cw < 10:
+            return "insufficient"
 
         try:
             # Landmarks are unreliable on tiny classroom faces at native size.
@@ -352,25 +352,13 @@ class ClassroomAttendanceSystem:
             mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
             nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
 
-            eyes_visible = eyes
-            if not eyes_visible:
-                # Fallback for very small/angled classroom faces where the
-                # landmark detector fails to resolve individual eye points.
-                # Look for real facial texture in the narrow eye-band region
-                # instead of a flat, featureless patch (which points to a
-                # lower-face-only fragment, an ear, or the back/side of a head).
-                try:
-                    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-                    eye_band = gray[int(ch * 0.12):int(ch * 0.42), int(cw * 0.08):int(cw * 0.92)]
-                    if eye_band.size:
-                        eye_std = float(np.std(eye_band))
-                        eye_edges = float(np.mean(cv2.Canny(eye_band, 50, 130) > 0))
-                        eyes_visible = eye_std > 14.0 and eye_edges > 0.02
-                except Exception:
-                    eyes_visible = False
-
-            # Eyes not visible at all: not a usable attendance detection.
-            if not eyes_visible:
+            # Eyes not visible at all: not a usable attendance detection. This
+            # is decided strictly from landmark detection — no texture-based
+            # fallback — because a "there's some texture here" fallback ends
+            # up being true for almost any crop (mouth, chin, hair, ear) and
+            # defeats the point of filtering out faces where the eyes aren't
+            # actually visible.
+            if not eyes:
                 return "insufficient"
 
             # Eyes visible, and the rest of the face (nose + mouth) is also
@@ -382,7 +370,7 @@ class ClassroomAttendanceSystem:
             # occlusion, mask, niqab, cropped edge, etc.).
             return "masked"
         except Exception:
-            return "clear"
+            return "insufficient"
 
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
         """Backward-compatible binary wrapper around ``classify_face_visibility``.
