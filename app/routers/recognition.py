@@ -175,10 +175,10 @@ def check_faces_stage(
     Detection itself (Stage 1) is untouched here — this stage only interprets
     the boxes it already received. Every candidate is passed through
     ``classify_face_visibility``:
-      * "insufficient" (no meaningful upper-face evidence — e.g. only a lower
-        face fragment, cheek, ear, or the back/side of a head) is dropped
-        entirely and does not appear in the results or the total face count.
-      * "masked" (upper face visible, lower face covered) is kept and always
+      * "insufficient" (eyes not visible — e.g. only a lower-face fragment,
+        cheek, ear, or the back/side of a head) is dropped entirely and does
+        not appear in the results or the total face count.
+      * "masked" (eyes visible, lower face covered) is kept and always
         reported as unrecognized further down the pipeline.
       * "clear" is kept and proceeds to normal recognition.
     """

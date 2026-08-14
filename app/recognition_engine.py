@@ -303,19 +303,19 @@ class ClassroomAttendanceSystem:
         touched by this method — it only interprets an already detected box.
 
         Returns one of:
-          * ``"clear"``        - a normal, sufficiently visible face. Proceeds
-            to recognition as usual.
-          * ``"masked"``       - the upper face (eyes/forehead/eyebrows) is
-            visible but the lower face is covered (mask, niqab, hand, etc.).
-            These faces are kept in the results but are always treated as
-            unrecognized for attendance — they are never matched to an
-            identity, because eyes-only evidence is not reliable enough.
-          * ``"insufficient"`` - there is no meaningful upper-face evidence at
-            all (e.g. only a lower-face fragment, cheek, ear, or the back/side
-            of a head is visible). These detections carry too little face
-            information to be a usable attendance record and are dropped
-            entirely — they are removed from the results and from the total
-            detected-face count.
+          * ``"clear"``        - a normal, sufficiently visible face with the
+            eyes visible. Proceeds to recognition as usual.
+          * ``"masked"``       - the eyes are visible but the lower face is
+            covered (mask, niqab, hand, etc.). These faces are kept in the
+            results but are always treated as unrecognized for attendance —
+            they are never matched to an identity, because eyes-only evidence
+            is not reliable enough.
+          * ``"insufficient"`` - the eyes are not visible at all (e.g. only a
+            lower-face fragment such as the mouth/chin/jaw, a cheek, an ear,
+            or the back/side of a head is visible). These detections carry
+            too little face information to be a usable attendance record and
+            are dropped entirely — they are removed from the results and from
+            the total detected-face count.
 
         The classifier uses several independent cues and a small landmark
         upscale pass. It is deliberately conservative: weak/ambiguous evidence
@@ -368,19 +368,25 @@ class ClassroomAttendanceSystem:
             eyes = bool(landmarks.get("left_eye")) and bool(landmarks.get("right_eye"))
             mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
             nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
-            brow = bool(landmarks.get("left_eyebrow")) or bool(landmarks.get("right_eyebrow"))
 
-            # --- Gate: is there any meaningful upper-face (eyes/forehead)
-            # evidence at all? Strong evidence is an eye or eyebrow landmark.
-            # When landmarks fail (common on small/angled classroom faces) we
-            # fall back to a texture check: the upper region must show real
-            # facial detail (skin/eye/brow structure), not a flat, low-detail
-            # patch such as the back of a head, hair, an ear, or a fragment
-            # that only captures the lower half of a face.
-            upper_landmark_evidence = eyes or brow
-            upper_texture_evidence = upper_std > 14.0 and upper_edges > 0.02
+            # A narrow eye-band (not the whole upper-face region used for the
+            # occlusion score below) is checked separately as a fallback for
+            # tiny/angled classroom faces where the landmark detector fails to
+            # resolve eye points even though eyes are physically present.
+            eye_band = gray[int(ch * 0.12):int(ch * 0.42), int(cw * 0.08):int(cw * 0.92)]
+            eye_band_std = float(np.std(eye_band)) if eye_band.size else 0.0
+            eye_band_edges = (
+                float(np.mean(cv2.Canny(eye_band, 50, 130) > 0)) if eye_band.size else 0.0
+            )
 
-            if not upper_landmark_evidence and not upper_texture_evidence:
+            # --- Gate: are the eyes actually visible? A detected box only
+            # counts as a real, attendance-eligible face when the eyes are
+            # visible. A box that only shows the lower half of a face (mouth,
+            # chin, jaw) with no eye evidence is not a usable detection and is
+            # dropped entirely rather than being counted or shown.
+            eyes_visible = eyes or (eye_band_std > 14.0 and eye_band_edges > 0.02)
+
+            if not eyes_visible:
                 return "insufficient"
 
             # --- Occlusion scoring for faces that do have upper-face evidence.
