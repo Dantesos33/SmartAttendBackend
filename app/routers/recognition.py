@@ -131,10 +131,8 @@ async def recognize_classroom(
         db_encoding_rows = encoding_query.all()
 
         os.makedirs("temp", exist_ok=True)
-        # Never reuse the uploaded filename: repeated captures can otherwise race
-        # over the same temp file and make a new request appear to process an old photo.
-        suffix = os.path.splitext(file.filename or "classroom.jpg")[1] or ".jpg"
-        temp_path = os.path.join("temp", f"recognize_{uuid.uuid4().hex}{suffix}")
+        extension = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
+        temp_path = os.path.join("temp", f"recognition_{uuid.uuid4().hex}{extension}")
 
         try:
             with open(temp_path, "wb") as buffer:
@@ -147,6 +145,8 @@ async def recognize_classroom(
                 db_encoding_rows=db_encoding_rows,
             )
         finally:
+            # Never leave an old capture behind and never let two concurrent
+            # attendance attempts read/write the same temp filename.
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
