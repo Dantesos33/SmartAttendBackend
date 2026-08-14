@@ -373,16 +373,19 @@ class ClassroomAttendanceSystem:
                 except Exception:
                     landmarks = {}
 
-            eyes = bool(landmarks.get("left_eye")) or bool(landmarks.get("right_eye"))
             mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
             nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
 
-            # Eyes not visible at all: not a usable attendance detection. This
-            # is decided strictly from landmark detection — no texture-based
-            # fallback — because a "there's some texture here" fallback ends
-            # up being true for almost any crop (mouth, chin, hair, ear) and
-            # defeats the point of filtering out faces where the eyes aren't
-            # actually visible.
+            # Forcing a face location makes the predictor fit points even on
+            # crops that don't actually contain eyes (a mouth/chin fragment,
+            # an ear, etc.) — it doesn't verify anything is really there.
+            # Validate the eye points before trusting them: they must sit in
+            # the upper part of the crop, be plausibly spread apart, and land
+            # on real local contrast (an iris/sclera edge), not a flat patch.
+            gray_lm = cv2.cvtColor(landmark_crop, cv2.COLOR_RGB2GRAY)
+            eyes = self._eye_landmarks_are_real(landmarks, gray_lm, lm_w, lm_h)
+
+            # Eyes not visible at all: not a usable attendance detection.
             if not eyes:
                 return "insufficient"
 
@@ -396,6 +399,51 @@ class ClassroomAttendanceSystem:
             return "masked"
         except Exception:
             return "insufficient"
+
+    @staticmethod
+    def _eye_landmarks_are_real(landmarks, gray_crop, lm_w, lm_h):
+        """Sanity-check eye landmark points instead of trusting them blindly.
+
+        When the landmark predictor is given a forced face location it will
+        fit points even on crops that have no eyes in them at all, so a
+        plain "was left_eye/right_eye present" check is not enough. This
+        verifies the points are geometrically plausible (in the upper part
+        of the crop, spread apart like a real eye pair) and sit over genuine
+        local contrast (an iris/sclera boundary), not a flat, featureless
+        patch of skin, hair, or fabric.
+        """
+        left_eye = landmarks.get("left_eye") or []
+        right_eye = landmarks.get("right_eye") or []
+        pts = list(left_eye) + list(right_eye)
+        if not pts or lm_h <= 0 or lm_w <= 0:
+            return False
+
+        # Eyes belong in the upper part of a face crop. A fit whose points
+        # sit in the lower half is a strong sign of a hallucinated match on
+        # a mouth/chin-only fragment.
+        avg_y_ratio = (sum(p[1] for p in pts) / len(pts)) / lm_h
+        if avg_y_ratio > 0.62:
+            return False
+
+        # If both eyes were found, they should be spread apart by a plausible
+        # fraction of the face width, not collapsed together.
+        if left_eye and right_eye:
+            lx = sum(p[0] for p in left_eye) / len(left_eye)
+            rx = sum(p[0] for p in right_eye) / len(right_eye)
+            if abs(rx - lx) < lm_w * 0.12:
+                return False
+
+        # Require real local contrast under each eye point.
+        for (px, py) in pts:
+            x0, x1 = max(0, px - 4), min(lm_w, px + 4)
+            y0, y1 = max(0, py - 4), min(lm_h, py + 4)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            patch = gray_crop[y0:y1, x0:x1]
+            if patch.size and float(np.std(patch)) < 8.0:
+                return False
+
+        return True
 
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
         """Backward-compatible binary wrapper around ``classify_face_visibility``.
