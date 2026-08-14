@@ -190,20 +190,49 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
-    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=85):
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=85, padded=False):
         try:
             h, w = rgb_image.shape[:2]
-            top = max(0, int(top))
-            left = max(0, int(left))
-            bottom = min(h, int(bottom))
-            right = min(w, int(right))
+            top, left = int(top), int(left)
+            bottom, right = int(bottom), int(right)
+            if padded:
+                fh, fw = max(1, bottom - top), max(1, right - left)
+                pad_y = int(fh * 0.45)
+                pad_x = int(fw * 0.45)
+                top -= pad_y; bottom += pad_y; left -= pad_x; right += pad_x
+            top = max(0, top); left = max(0, left)
+            bottom = min(h, bottom); right = min(w, right)
             if bottom <= top or right <= left:
                 return None
             crop = rgb_image[top:bottom, left:right]
             crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
-            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality)
+            # Preserve a high-quality square-ish crop for profile enrollment.
+            size = max(crop_bgr.shape[:2])
+            scale = 512.0 / max(1, size)
+            if scale != 1.0:
+                crop_bgr = cv2.resize(crop_bgr, (max(1, int(crop_bgr.shape[1]*scale)), max(1, int(crop_bgr.shape[0]*scale))), interpolation=cv2.INTER_LANCZOS4)
+            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality, max_edge=512)
         except Exception:
             return None
+
+    def classify_face_occlusion(self, rgb_image, location):
+        """Lightweight stage-2 classifier. Detection is independent from identity."""
+        top, right, bottom, left = [int(x) for x in location]
+        h, w = rgb_image.shape[:2]
+        top=max(0,top); left=max(0,left); bottom=min(h,bottom); right=min(w,right)
+        if bottom <= top or right <= left:
+            return "clear"
+        crop = rgb_image[top:bottom, left:right]
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml")
+        smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
+        eyes = eye_cascade.detectMultiScale(gray, 1.1, 4, minSize=(max(8, gray.shape[1]//12), max(8, gray.shape[0]//12)))
+        lower = gray[gray.shape[0]//2:, :] if gray.shape[0] > 2 else gray
+        smiles = smile_cascade.detectMultiScale(lower, 1.7, 20, minSize=(max(10, gray.shape[1]//8), max(5, gray.shape[0]//12)))
+        # Two visible eyes with no mouth-region signal is treated as masked/occluded.
+        if len(eyes) >= 2 and len(smiles) == 0:
+            return "masked"
+        return "clear"
 
     @staticmethod
     def _downscale_rgb(rgb_image, max_edge):
