@@ -174,13 +174,14 @@ def check_faces_stage(
 
     Detection itself (Stage 1) is untouched here — this stage only interprets
     the boxes it already received. Every candidate is passed through
-    ``classify_face_visibility``:
+    ``classify_face_visibility``, which is now based on eyes visibility only:
       * "insufficient" (eyes not visible — e.g. only a lower-face fragment,
         cheek, ear, or the back/side of a head) is dropped entirely and does
         not appear in the results or the total face count.
-      * "masked" (eyes visible, lower face covered) is kept and always
-        reported as unrecognized further down the pipeline.
-      * "clear" is kept and proceeds to normal recognition.
+      * "masked" (eyes visible, but the face is not fully visible) is kept
+        and always reported as unrecognized further down the pipeline.
+      * "clear" (eyes, nose, and mouth all visible — a fully visible face)
+        is kept and proceeds to normal recognition.
     """
     job = _load_job(job_id)
     section = _validate_section(db, job["section_id"], current_user)

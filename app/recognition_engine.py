@@ -296,31 +296,27 @@ class ClassroomAttendanceSystem:
 
 
     def classify_face_visibility(self, rgb_image, location, encoding_available=False):
-        """Stage-2 visibility + occlusion classification.
+        """Stage-2 visibility classification, based on eyes visibility only.
 
         Detection is intentionally NOT performed here.  The detector (Stage 1,
         ``_detect_face_locations``) has a protected baseline and is never
         touched by this method — it only interprets an already detected box.
+        The old upper-face-region/lower-face-region brightness+edge occlusion
+        scoring has been removed in favor of a simple, direct check.
 
         Returns one of:
-          * ``"clear"``        - a normal, sufficiently visible face with the
-            eyes visible. Proceeds to recognition as usual.
-          * ``"masked"``       - the eyes are visible but the lower face is
-            covered (mask, niqab, hand, etc.). These faces are kept in the
-            results but are always treated as unrecognized for attendance —
-            they are never matched to an identity, because eyes-only evidence
-            is not reliable enough.
+          * ``"clear"``        - the face is fully visible: eyes, nose, and
+            mouth are all visible. Proceeds to normal recognition/matching.
+          * ``"masked"``       - the eyes are visible but the face is not
+            fully visible (mask, niqab, hand, partial occlusion, etc.).
+            These faces are kept in the results but are always treated as
+            unrecognized for attendance — they are never matched to an
+            identity.
           * ``"insufficient"`` - the eyes are not visible at all (e.g. only a
             lower-face fragment such as the mouth/chin/jaw, a cheek, an ear,
-            or the back/side of a head is visible). These detections carry
-            too little face information to be a usable attendance record and
-            are dropped entirely — they are removed from the results and from
-            the total detected-face count.
-
-        The classifier uses several independent cues and a small landmark
-        upscale pass. It is deliberately conservative: weak/ambiguous evidence
-        always resolves to "clear" so normal profile, downward-facing, and
-        small classroom faces are never wrongly dropped or blanket-masked.
+            or the back/side of a head is visible). These detections are
+            dropped entirely — removed from the results and from the total
+            detected-face count.
         """
         top, right, bottom, left = [int(x) for x in location]
         h, w = rgb_image.shape[:2]
@@ -331,23 +327,10 @@ class ClassroomAttendanceSystem:
 
         crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
         ch, cw = crop.shape[:2]
-        if ch < 36 or cw < 24:
+        if ch < 24 or cw < 24:
             return "clear"
 
         try:
-            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-            upper = gray[int(ch * 0.15):int(ch * 0.52), int(cw * 0.08):int(cw * 0.92)]
-            lower = gray[int(ch * 0.48):int(ch * 0.90), int(cw * 0.08):int(cw * 0.92)]
-            if upper.size == 0 or lower.size == 0:
-                return "clear"
-
-            upper_mean, lower_mean = float(np.mean(upper)), float(np.mean(lower))
-            upper_std, lower_std = float(np.std(upper)), float(np.std(lower))
-            ue = cv2.Canny(upper, 50, 130)
-            le = cv2.Canny(lower, 50, 130)
-            upper_edges = float(np.mean(ue > 0))
-            lower_edges = float(np.mean(le > 0))
-
             # Landmarks are unreliable on tiny classroom faces at native size.
             # Upscale only this small crop; this does not affect Stage-1 detection.
             landmark_crop = crop
@@ -365,73 +348,39 @@ class ClassroomAttendanceSystem:
             except Exception:
                 landmarks = {}
 
-            eyes = bool(landmarks.get("left_eye")) and bool(landmarks.get("right_eye"))
+            eyes = bool(landmarks.get("left_eye")) or bool(landmarks.get("right_eye"))
             mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
             nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
 
-            # A narrow eye-band (not the whole upper-face region used for the
-            # occlusion score below) is checked separately as a fallback for
-            # tiny/angled classroom faces where the landmark detector fails to
-            # resolve eye points even though eyes are physically present.
-            eye_band = gray[int(ch * 0.12):int(ch * 0.42), int(cw * 0.08):int(cw * 0.92)]
-            eye_band_std = float(np.std(eye_band)) if eye_band.size else 0.0
-            eye_band_edges = (
-                float(np.mean(cv2.Canny(eye_band, 50, 130) > 0)) if eye_band.size else 0.0
-            )
+            eyes_visible = eyes
+            if not eyes_visible:
+                # Fallback for very small/angled classroom faces where the
+                # landmark detector fails to resolve individual eye points.
+                # Look for real facial texture in the narrow eye-band region
+                # instead of a flat, featureless patch (which points to a
+                # lower-face-only fragment, an ear, or the back/side of a head).
+                try:
+                    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                    eye_band = gray[int(ch * 0.12):int(ch * 0.42), int(cw * 0.08):int(cw * 0.92)]
+                    if eye_band.size:
+                        eye_std = float(np.std(eye_band))
+                        eye_edges = float(np.mean(cv2.Canny(eye_band, 50, 130) > 0))
+                        eyes_visible = eye_std > 14.0 and eye_edges > 0.02
+                except Exception:
+                    eyes_visible = False
 
-            # --- Gate: are the eyes actually visible? A detected box only
-            # counts as a real, attendance-eligible face when the eyes are
-            # visible. A box that only shows the lower half of a face (mouth,
-            # chin, jaw) with no eye evidence is not a usable detection and is
-            # dropped entirely rather than being counted or shown.
-            eyes_visible = eyes or (eye_band_std > 14.0 and eye_band_edges > 0.02)
-
+            # Eyes not visible at all: not a usable attendance detection.
             if not eyes_visible:
                 return "insufficient"
 
-            # --- Occlusion scoring for faces that do have upper-face evidence.
-            # Score independent signals instead of relying on one brittle rule.
-            score = 0
+            # Eyes visible, and the rest of the face (nose + mouth) is also
+            # visible: this is a fully visible, normal face.
+            if eyes and mouth and nose:
+                return "clear"
 
-            # Eyes visible but mouth structure missing is a strong occlusion cue.
-            if eyes and not mouth:
-                score += 2
-
-            # If eyes are visible but both mouth and nose structure are absent,
-            # this is particularly useful for niqab/face-covering cases.
-            if eyes and not mouth and not nose:
-                score += 2
-
-            # Covered lower faces are commonly flatter/less textured than the
-            # upper face.  Require a meaningful relative difference, not a fixed
-            # brightness threshold so lighting/skin tone do not dominate.
-            texture_flat = (
-                lower_std < max(upper_std * 0.78, 9.0) and
-                lower_edges < max(upper_edges * 0.72, 0.016)
-            )
-            if texture_flat:
-                score += 1
-
-            # A dark/opaque lower covering is an additional cue, but it is never
-            # sufficient by itself because shadows and hair can look similar.
-            dark_cover = (
-                upper_mean > 45 and
-                lower_mean < upper_mean * 0.72 and
-                lower_std < max(upper_std * 0.82, 9.0)
-            )
-            if dark_cover:
-                score += 1
-
-            # Very low lower-face detail combined with visible eyes is useful for
-            # masks/niqabs even when the landmark detector only finds the eyes.
-            if eyes and lower_edges < max(upper_edges * 0.82, 0.018):
-                score += 1
-
-            # Require strong evidence.  This reduces false positives on sideways,
-            # downward-facing and low-resolution clear faces.
-            if score >= 3:
-                return "masked"
-            return "clear"
+            # Eyes visible but the face is not fully visible (partial
+            # occlusion, mask, niqab, cropped edge, etc.).
+            return "masked"
         except Exception:
             return "clear"
 
@@ -440,7 +389,7 @@ class ClassroomAttendanceSystem:
 
         Kept for any caller that only understands clear/masked. New code
         should call ``classify_face_visibility`` directly to also get the
-        "insufficient" (no upper-face evidence) state.
+        "insufficient" (eyes not visible) state.
         """
         visibility = self.classify_face_visibility(
             rgb_image, location, encoding_available=encoding_available
