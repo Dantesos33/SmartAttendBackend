@@ -131,8 +131,10 @@ async def recognize_classroom(
         db_encoding_rows = encoding_query.all()
 
         os.makedirs("temp", exist_ok=True)
-        extension = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
-        temp_path = os.path.join("temp", f"recognition_{uuid.uuid4().hex}{extension}")
+        # Unique temporary names prevent repeated captures from reusing an old
+        # image when the frontend sends the same filename again.
+        suffix = os.path.splitext(file.filename or "capture.jpg")[1].lower() or ".jpg"
+        temp_path = os.path.join("temp", f"attendance_{uuid.uuid4().hex}{suffix}")
 
         try:
             with open(temp_path, "wb") as buffer:
@@ -144,27 +146,28 @@ async def recognize_classroom(
                 allowed_student_ids=allowed_student_ids,
                 db_encoding_rows=db_encoding_rows,
             )
+
+            if not attendance_data:
+                raise HTTPException(status_code=400, detail=message)
+
+            if allowed_student_ids is not None:
+                missing = students_missing_face_data(db, allowed_student_ids)
+                attendance_data["students_missing_face_data"] = missing
+                if missing and not attendance_data.get("recognition_available"):
+                    names = ", ".join(item["name"] for item in missing[:5])
+                    extra = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+                    attendance_data["warning_message"] = (
+                        "These enrolled students need to re-upload their profile photo "
+                        f"so face recognition can work: {names}{extra}."
+                    )
+
+            return {"status": "success", "message": message, "data": attendance_data}
         finally:
-            # Never leave an old capture behind and never let two concurrent
-            # attendance attempts read/write the same temp filename.
             if os.path.exists(temp_path):
-                os.remove(temp_path)
-
-        if not attendance_data:
-            raise HTTPException(status_code=400, detail=message)
-
-        if allowed_student_ids is not None:
-            missing = students_missing_face_data(db, allowed_student_ids)
-            attendance_data["students_missing_face_data"] = missing
-            if missing and not attendance_data.get("recognition_available"):
-                names = ", ".join(item["name"] for item in missing[:5])
-                extra = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
-                attendance_data["warning_message"] = (
-                    "These enrolled students need to re-upload their profile photo "
-                    f"so face recognition can work: {names}{extra}."
-                )
-
-        return {"status": "success", "message": message, "data": attendance_data}
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     except HTTPException:
         raise
