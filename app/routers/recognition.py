@@ -148,12 +148,7 @@ async def detect_faces_stage(
         shutil.copyfileobj(file.file, buffer)
     try:
         image = face_recognition.load_image_file(image_path)
-        # Stage 1 detector is completely unchanged. Only after it returns all
-        # candidates do we remove boxes with no visible eye region.
-        detected_locations = attendance_system._detect_face_locations(image)
-        locations = attendance_system.filter_locations_without_visible_eyes(
-            image, detected_locations
-        )
+        locations = attendance_system._detect_face_locations(image)
         faces = [
             {"face_index": i, "location": {"top": int(t), "right": int(r), "bottom": int(b), "left": int(l)}}
             for i, (t, r, b, l) in enumerate(locations)
@@ -242,7 +237,7 @@ def check_enrollment_stage(
         clear_encodings,
         tolerance=float(tolerance),
         allowed_set=allowed_set,
-        min_confidence=0.50,
+        min_confidence=0.36,
     )
 
     present_ids = []
@@ -254,8 +249,12 @@ def check_enrollment_stage(
         confidence = 0.0
         status = face["face_status"]
 
+        # Masked/occluded faces are intentionally treated as unrecognized for
+        # attendance. They must never be marked Present because their visible
+        # facial information is insufficient for reliable identity matching.
         if status == "masked":
-            name = "Masked"
+            name = "Unrecognized"
+            status = "unrecognized"
         elif face_index in assignments:
             student_id, name, confidence = assignments[face_index]
             if student_id is None:
@@ -266,7 +265,7 @@ def check_enrollment_stage(
         final_faces.append({
             "face_index": face_index, "student_id": student_id, "name": name,
             "confidence": float(confidence), "face_status": status,
-            "attendance_status": "masked" if status == "masked" else ("present" if student_id else "unrecognized"),
+            "attendance_status": "unrecognized" if status == "unrecognized" else ("present" if student_id else "unrecognized"),
             "location": face["location"], "crop_base64": face.get("crop_base64"),
         })
     absent_ids = [sid for sid in allowed_student_ids if sid not in present_ids]
@@ -286,7 +285,7 @@ def check_enrollment_stage(
     result = {
         "section_id": section.id, "faces_detected": len(final_faces), "present_student_ids": present_ids,
         "absent_student_ids": absent_ids, "present_count": len(present_ids), "absent_count": len(absent_ids),
-        "masked_count": sum(1 for f in final_faces if f["attendance_status"] == "masked"),
+        "masked_count": 0,
         "unknown_faces": sum(1 for f in final_faces if f["attendance_status"] == "unrecognized"),
         "face_details": final_faces, "annotated_image_base64": annotated_b64,
         "enrolled_with_face_photos": len(attendance_system.known_face_ids), "recognition_available": bool(attendance_system.known_face_encodings),
