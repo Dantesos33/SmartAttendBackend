@@ -277,31 +277,265 @@ class ClassroomAttendanceSystem:
             name = self.metadata.get(str(student_id), {}).get("name", f"Student {student_id}")
             self._register_encoding(filepath, student_id, name)
 
-    def _detect_face_locations(self, rgb_image):
-        """Clean, fast detection scaled correctly across the full group image."""
-        h, w = rgb_image.shape[:2]
-        detect_img, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
-        inv_scale = 1.0 / scale
+    @staticmethod
+    def _box_iou(a, b):
+        at, ar, ab, al = a
+        bt, br, bb, bl = b
+        left = max(al, bl)
+        top = max(at, bt)
+        right = min(ar, br)
+        bottom = min(ab, bb)
+        if right <= left or bottom <= top:
+            return 0.0
+        inter = float((right - left) * (bottom - top))
+        area_a = float(max(1, ar - al) * max(1, ab - at))
+        area_b = float(max(1, br - bl) * max(1, bb - bt))
+        return inter / max(1.0, area_a + area_b - inter)
 
-        # Single pass with upsample=1 detects group faces accurately without CPU timeout
-        small_locations = face_recognition.face_locations(
-            detect_img, 
-            number_of_times_to_upsample=1, 
-            model="hog"
+    def _dedupe_face_locations(self, locations, image_shape):
+        """Merge detections from multiple detectors without losing small faces."""
+        h, w = image_shape[:2]
+        candidates = []
+        for loc in locations:
+            t, r, b, l = [int(v) for v in loc]
+            t = max(0, min(h - 1, t)); b = max(0, min(h, b))
+            l = max(0, min(w - 1, l)); r = max(0, min(w, r))
+            bw, bh = r - l, b - t
+            if bw < 24 or bh < 24:
+                continue
+            ratio = bw / float(max(1, bh))
+            if ratio < 0.45 or ratio > 1.9:
+                continue
+            candidates.append((t, r, b, l))
+
+        # Prefer larger, more complete detections when two detectors found the
+        # same person. This keeps the small-face recovery boxes only when they
+        # don't overlap an already good detection.
+        candidates.sort(key=lambda x: (x[2]-x[0])*(x[1]-x[3]), reverse=True)
+        kept = []
+        for candidate in candidates:
+            if any(self._box_iou(candidate, existing) >= 0.35 for existing in kept):
+                continue
+            kept.append(candidate)
+
+        kept.sort(key=lambda x: (x[0], x[3]))
+        return kept
+
+    @staticmethod
+    def _map_rotated_location(location, original_shape, rotation):
+        """Map a box from a cv2.rotate image back to the original image."""
+        h, w = original_shape[:2]
+        t, r, b, l = [int(v) for v in location]
+        if rotation == "cw":
+            return (l, h - t, r, h - b)
+        if rotation == "ccw":
+            return (w - r, b, w - l, t)
+        if rotation == "180":
+            return (h - b, w - l, h - t, w - r)
+        return (t, r, b, l)
+
+    def _eye_pair_face_proposals(self, rgb_image):
+        """Recover niqab/mask faces where only the eye region is visible.
+
+        We only create a face proposal when two eye detections have plausible
+        spacing/alignment. This is intentionally conservative so random eyes
+        in posters/backgrounds do not turn into dozens of face boxes.
+        """
+        gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape[:2]
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
+        )
+        if cascade.empty():
+            return []
+
+        min_eye = max(10, int(min(h, w) * 0.012))
+        eyes = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.08,
+            minNeighbors=5,
+            minSize=(min_eye, min_eye),
+        )
+        if len(eyes) < 2:
+            return []
+
+        proposals = []
+        centers = []
+        for x, y, ew, eh in eyes:
+            centers.append((x + ew / 2.0, y + eh / 2.0, ew, eh))
+
+        for i, (x1, y1, ew1, eh1) in enumerate(centers):
+            for x2, y2, ew2, eh2 in centers[i + 1:]:
+                dx = abs(x2 - x1)
+                dy = abs(y2 - y1)
+                eye_size = max(ew1, eh1, ew2, eh2)
+                if dx < eye_size * 1.4 or dx > eye_size * 10.0:
+                    continue
+                if dy > max(eye_size * 0.9, dx * 0.28):
+                    continue
+
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                face_w = max(dx * 2.45, eye_size * 5.0)
+                face_h = face_w * 1.28
+                left = int(cx - face_w / 2.0)
+                right = int(cx + face_w / 2.0)
+                top = int(cy - face_h * 0.38)
+                bottom = int(cy + face_h * 0.62)
+
+                if right-left < 28 or bottom-top < 28:
+                    continue
+                if right-left > w * 0.32 or bottom-top > h * 0.45:
+                    continue
+                proposals.append((top, right, bottom, left))
+
+        return self._dedupe_face_locations(proposals, rgb_image.shape)
+
+    def _detect_face_locations(self, rgb_image):
+        """Detect faces independently of recognition, including difficult group-photo faces.
+
+        The detector intentionally combines several lightweight passes:
+        - frontal HOG for normal faces;
+        - OpenCV frontal/profile cascades for small/partial faces;
+        - 90/270-degree HOG recovery for faces looking down/up or presented at
+          difficult orientations;
+        - eye-pair proposals for masks/niqabs where only the eyes are visible.
+
+        Every pass is sequential and downscaled so Railway memory stays bounded.
+        """
+        original = np.ascontiguousarray(rgb_image)
+        h, w = original.shape[:2]
+        detect_img, scale = self._downscale_rgb(original, MAX_DETECT_EDGE)
+        inv_scale = 1.0 / scale
+        raw = []
+
+        def restore(loc):
+            t, r, b, l = loc
+            return (
+                max(0, int(round(t * inv_scale))),
+                min(w, int(round(r * inv_scale))),
+                min(h, int(round(b * inv_scale))),
+                max(0, int(round(l * inv_scale))),
+            )
+
+        # 1) Primary frontal HOG.
+        try:
+            for loc in face_recognition.face_locations(
+                detect_img, number_of_times_to_upsample=1, model="hog"
+            ):
+                raw.append(restore(loc))
+        except Exception as exc:
+            print(f"Primary HOG detection failed: {exc}")
+
+        gray = cv2.cvtColor(detect_img, cv2.COLOR_RGB2GRAY)
+        frontal = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+        )
+        profile = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_profileface.xml"
         )
 
-        full_locations = []
-        for top, right, bottom, left in small_locations:
-            orig_top = max(0, int(round(top * inv_scale)))
-            orig_right = min(w, int(round(right * inv_scale)))
-            orig_bottom = min(h, int(round(bottom * inv_scale)))
-            orig_left = max(0, int(round(left * inv_scale)))
+        # 2) Frontal/profile Haar recovery. minNeighbors is deliberately high
+        # enough to avoid the 32+ false boxes seen with the old eye-only pass.
+        min_face = max(22, int(min(detect_img.shape[:2]) * 0.035))
+        eye_probe = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
+        )
 
-            if orig_bottom > orig_top + 15 and orig_right > orig_left + 15:
-                full_locations.append((orig_top, orig_right, orig_bottom, orig_left))
+        def haar_has_eye_signal(x, y, bw, bh, allow_single=True):
+            if eye_probe.empty():
+                return True
+            x1 = max(0, x); y1 = max(0, y)
+            x2 = min(gray.shape[1], x + bw); y2 = min(gray.shape[0], y + int(bh * 0.72))
+            roi = gray[y1:y2, x1:x2]
+            if roi.size == 0:
+                return False
+            ey = eye_probe.detectMultiScale(
+                roi, scaleFactor=1.08, minNeighbors=5,
+                minSize=(max(5, int(bw * 0.08)), max(5, int(bh * 0.08))),
+            )
+            return len(ey) >= (1 if allow_single else 2)
 
-        print(f"Detected {len(full_locations)} face(s) in image.")
-        return full_locations
+        if not frontal.empty():
+            boxes = frontal.detectMultiScale(
+                gray, scaleFactor=1.06, minNeighbors=7,
+                minSize=(min_face, min_face),
+            )
+            for x, y, bw, bh in boxes:
+                # Reject background rectangles such as bags/clothing that the
+                # frontal cascade occasionally produces. Real faces normally
+                # have at least one eye signal in the upper face region.
+                if haar_has_eye_signal(x, y, bw, bh, allow_single=True):
+                    raw.append(restore((y, x+bw, y+bh, x)))
+
+        if not profile.empty():
+            for source, mirrored in ((gray, False), (cv2.flip(gray, 1), True)):
+                boxes = profile.detectMultiScale(
+                    source, scaleFactor=1.06, minNeighbors=6,
+                    minSize=(min_face, min_face),
+                )
+                for x, y, bw, bh in boxes:
+                    if mirrored:
+                        x = gray.shape[1] - x - bw
+                    if haar_has_eye_signal(x, y, bw, bh, allow_single=True):
+                        raw.append(restore((y, x+bw, y+bh, x)))
+
+        # 3) Small-face tile recovery. A group photo can contain people whose
+        # faces are only a few dozen pixels wide. HOG on the whole image can
+        # miss those, while a sequential overlapping tile gives the detector
+        # much more face resolution without the memory cost of full-image
+        # upsample=2/3.
+        th, tw = detect_img.shape[:2]
+        tile_w = max(420, int(tw * 0.62))
+        tile_h = max(360, int(th * 0.62))
+        step_x = max(1, int(tile_w * 0.78))
+        step_y = max(1, int(tile_h * 0.78))
+        xs = sorted(set([0, max(0, tw - tile_w)] + list(range(0, max(1, tw - tile_w + 1), step_x))))
+        ys = sorted(set([0, max(0, th - tile_h)] + list(range(0, max(1, th - tile_h + 1), step_y))))
+        for y0 in ys:
+            for x0 in xs:
+                tile = detect_img[y0:min(th, y0+tile_h), x0:min(tw, x0+tile_w)]
+                if tile.shape[0] < 300 or tile.shape[1] < 300:
+                    continue
+                try:
+                    # Upsample only the tile, not the complete classroom image.
+                    for loc in face_recognition.face_locations(
+                        tile, number_of_times_to_upsample=1, model="hog"
+                    ):
+                        t, r, b, l = loc
+                        raw.append(restore((t+y0, r+x0, b+y0, l+x0)))
+                except Exception as exc:
+                    print(f"HOG tile detection failed at ({x0},{y0}): {exc}")
+                del tile
+                gc.collect()
+
+        # 4) Orientation recovery.
+        for rotation, rotated in (
+            ("cw", cv2.rotate(detect_img, cv2.ROTATE_90_CLOCKWISE)),
+            ("ccw", cv2.rotate(detect_img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+        ):
+            try:
+                for loc in face_recognition.face_locations(
+                    rotated, number_of_times_to_upsample=1, model="hog"
+                ):
+                    mapped = self._map_rotated_location(loc, detect_img.shape, rotation)
+                    raw.append(restore(mapped))
+            except Exception as exc:
+                print(f"Rotated HOG ({rotation}) failed: {exc}")
+            del rotated
+            gc.collect()
+
+        # 5) Eye-pair recovery for masks/niqabs. Work on the already-downscaled
+        # image and restore boxes to original coordinates.
+        try:
+            for loc in self._eye_pair_face_proposals(detect_img):
+                raw.append(restore(loc))
+        except Exception as exc:
+            print(f"Eye-pair recovery failed: {exc}")
+
+        final_locations = self._dedupe_face_locations(raw, original.shape)
+        print(f"Detected {len(final_locations)} face(s) in image.")
+        return final_locations
 
     def _assign_faces_to_students(
         self,
