@@ -224,15 +224,75 @@ class ClassroomAttendanceSystem:
             return "clear"
         crop = rgb_image[top:bottom, left:right]
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-        eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml")
-        smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
-        eyes = eye_cascade.detectMultiScale(gray, 1.1, 4, minSize=(max(8, gray.shape[1]//12), max(8, gray.shape[0]//12)))
-        lower = gray[gray.shape[0]//2:, :] if gray.shape[0] > 2 else gray
-        smiles = smile_cascade.detectMultiScale(lower, 1.7, 20, minSize=(max(10, gray.shape[1]//8), max(5, gray.shape[0]//12)))
-        # Two visible eyes with no mouth-region signal is treated as masked/occluded.
-        if len(eyes) >= 2 and len(smiles) == 0:
-            return "masked"
-        return "clear"
+
+        # Do not assume the OpenCV Python build contains the legacy Haar API.
+        # Some Railway/OpenCV wheels expose cv2 without CascadeClassifier; a
+        # missing optional cascade must never crash the attendance request.
+        cascade_cls = getattr(cv2, "CascadeClassifier", None)
+        haar_root = getattr(getattr(cv2, "data", None), "haarcascades", None)
+        if cascade_cls is None or not haar_root:
+            return self._fallback_occlusion_classification(crop)
+
+        try:
+            eye_path = os.path.join(haar_root, "haarcascade_eye_tree_eyeglasses.xml")
+            smile_path = os.path.join(haar_root, "haarcascade_smile.xml")
+            eye_cascade = cascade_cls(eye_path) if os.path.exists(eye_path) else None
+            smile_cascade = cascade_cls(smile_path) if os.path.exists(smile_path) else None
+
+            eyes = []
+            if eye_cascade is not None and not eye_cascade.empty():
+                eyes = eye_cascade.detectMultiScale(
+                    gray, 1.1, 4,
+                    minSize=(max(8, gray.shape[1] // 12), max(8, gray.shape[0] // 12)),
+                )
+
+            smiles = []
+            if smile_cascade is not None and not smile_cascade.empty() and gray.shape[0] > 2:
+                lower = gray[gray.shape[0] // 2:, :]
+                smiles = smile_cascade.detectMultiScale(
+                    lower, 1.7, 20,
+                    minSize=(max(10, gray.shape[1] // 8), max(5, gray.shape[0] // 12)),
+                )
+
+            if len(eyes) >= 2 and len(smiles) == 0:
+                return "masked"
+            if len(eyes) >= 1 and len(smiles) == 0:
+                return self._fallback_occlusion_classification(crop)
+            return "clear"
+        except Exception as exc:
+            print(f"Optional mask cascade unavailable; using fallback: {exc}")
+            return self._fallback_occlusion_classification(crop)
+
+    @staticmethod
+    def _fallback_occlusion_classification(rgb_crop):
+        """Safe fallback when Haar cascades are unavailable.
+
+        This intentionally returns clear unless there is a strong lower-face
+        occlusion signal. It is better to keep a detected face in the pipeline
+        than to crash or silently discard it when an optional OpenCV component
+        is missing.
+        """
+        try:
+            h, w = rgb_crop.shape[:2]
+            if h < 24 or w < 24:
+                return "clear"
+            gray = cv2.cvtColor(rgb_crop, cv2.COLOR_RGB2GRAY)
+            upper = gray[int(h * 0.18):int(h * 0.52), :]
+            lower = gray[int(h * 0.52):int(h * 0.92), :]
+            if upper.size == 0 or lower.size == 0:
+                return "clear"
+            # A very low-variance, strongly darker lower-face region is a useful
+            # conservative signal for masks/niqab, without rejecting normal
+            # faces based on colour.
+            upper_mean = float(np.mean(upper))
+            lower_mean = float(np.mean(lower))
+            upper_std = float(np.std(upper))
+            lower_std = float(np.std(lower))
+            if upper_mean > 35 and lower_mean < upper_mean * 0.58 and lower_std < upper_std * 0.9:
+                return "masked"
+            return "clear"
+        except Exception:
+            return "clear"
 
     @staticmethod
     def _downscale_rgb(rgb_image, max_edge):
@@ -343,9 +403,18 @@ class ClassroomAttendanceSystem:
         """
         gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
         h, w = gray.shape[:2]
-        cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
-        )
+        cascade_cls = getattr(cv2, "CascadeClassifier", None)
+        haar_root = getattr(getattr(cv2, "data", None), "haarcascades", None)
+        if cascade_cls is None or not haar_root:
+            return []
+        eye_path = os.path.join(haar_root, "haarcascade_eye_tree_eyeglasses.xml")
+        if not os.path.exists(eye_path):
+            return []
+        try:
+            cascade = cascade_cls(eye_path)
+        except Exception as exc:
+            print(f"Eye Haar cascade unavailable: {exc}")
+            return []
         if cascade.empty():
             return []
 
@@ -428,22 +497,35 @@ class ClassroomAttendanceSystem:
             print(f"Primary HOG detection failed: {exc}")
 
         gray = cv2.cvtColor(detect_img, cv2.COLOR_RGB2GRAY)
-        frontal = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
-        )
-        profile = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_profileface.xml"
-        )
+        # OpenCV Haar cascades are optional recovery detectors. Some production
+        # cv2 builds do not expose CascadeClassifier at all, so never let the
+        # optional detector take down the complete recognition request.
+        cascade_cls = getattr(cv2, "CascadeClassifier", None)
+        haar_root = getattr(getattr(cv2, "data", None), "haarcascades", None)
+
+        def make_cascade(filename):
+            if cascade_cls is None or not haar_root:
+                return None
+            path = os.path.join(haar_root, filename)
+            if not os.path.exists(path):
+                return None
+            try:
+                detector = cascade_cls(path)
+                return detector if not detector.empty() else None
+            except Exception as exc:
+                print(f"Optional Haar detector {filename} unavailable: {exc}")
+                return None
+
+        frontal = make_cascade("haarcascade_frontalface_alt2.xml")
+        profile = make_cascade("haarcascade_profileface.xml")
 
         # 2) Frontal/profile Haar recovery. minNeighbors is deliberately high
         # enough to avoid the 32+ false boxes seen with the old eye-only pass.
         min_face = max(22, int(min(detect_img.shape[:2]) * 0.035))
-        eye_probe = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
-        )
+        eye_probe = make_cascade("haarcascade_eye_tree_eyeglasses.xml")
 
         def haar_has_eye_signal(x, y, bw, bh, allow_single=True):
-            if eye_probe.empty():
+            if eye_probe is None:
                 return True
             x1 = max(0, x); y1 = max(0, y)
             x2 = min(gray.shape[1], x + bw); y2 = min(gray.shape[0], y + int(bh * 0.72))
@@ -456,7 +538,7 @@ class ClassroomAttendanceSystem:
             )
             return len(ey) >= (1 if allow_single else 2)
 
-        if not frontal.empty():
+        if frontal is not None:
             boxes = frontal.detectMultiScale(
                 gray, scaleFactor=1.06, minNeighbors=7,
                 minSize=(min_face, min_face),
@@ -468,7 +550,7 @@ class ClassroomAttendanceSystem:
                 if haar_has_eye_signal(x, y, bw, bh, allow_single=True):
                     raw.append(restore((y, x+bw, y+bh, x)))
 
-        if not profile.empty():
+        if profile is not None:
             for source, mirrored in ((gray, False), (cv2.flip(gray, 1), True)):
                 boxes = profile.detectMultiScale(
                     source, scaleFactor=1.06, minNeighbors=6,
