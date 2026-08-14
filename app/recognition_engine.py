@@ -8,21 +8,15 @@ from datetime import datetime
 import json
 
 MIN_CONFIDENCE = 0.48
-MAX_DETECT_EDGE = 1280
-MAX_DETECT_EDGE_LARGE = 1920
-MAX_ANNOTATED_EDGE = 1200
+MAX_DETECT_EDGE = 1920
+MAX_DETECT_EDGE_LARGE = 2560
+MAX_ANNOTATED_EDGE = 1400
 LARGE_IMAGE_PIXELS = 2_000_000
 
 class ClassroomAttendanceSystem:
     """
     Keyed by real student_id (the database's users.id) rather than a typed
-    name string. This is what lets a recognition result map directly back to
-    a real enrolled student — there's no more "reconcile this name string
-    against the roster" step, which used to be the actual gap in the system.
-
-    known_face_ids[i] / known_face_encodings[i] / known_face_names[i] are
-    parallel lists — names are kept only for display/logging, never used as
-    the actual key.
+    name string.
     """
 
     def __init__(self, known_students_dir="known_students"):
@@ -99,9 +93,6 @@ class ClassroomAttendanceSystem:
         return self.known_face_encodings[idx]
 
     def load_known_students_from_dir(self):
-        """Load every registered face from disk. Files are named
-        {student_id}.jpg — metadata.json (keyed by student_id as a string,
-        since JSON object keys are always strings) holds the display name."""
         print("Loading known students...")
         self.known_face_encodings = []
         self.known_face_ids = []
@@ -112,8 +103,6 @@ class ClassroomAttendanceSystem:
                 filepath = os.path.join(self.known_students_dir, filename)
                 stem = os.path.splitext(filename)[0]
                 if not stem.isdigit():
-                    # Skip any leftover legacy name-keyed files from before
-                    # this rework — they have no real student_id to attach to.
                     continue
                 student_id = int(stem)
                 name = self.metadata.get(str(student_id), {}).get("name", f"Student {student_id}")
@@ -151,8 +140,6 @@ class ClassroomAttendanceSystem:
             return False, f"Error processing image: {str(e)}", None
 
     def verify_face_quality(self, image_path):
-        """Check-only, no registration — used to validate a photo upload
-        before accepting it as a profile photo (exactly one clear face)."""
         try:
             image = face_recognition.load_image_file(image_path)
             image, _ = self._downscale_rgb(image, MAX_DETECT_EDGE)
@@ -166,8 +153,6 @@ class ClassroomAttendanceSystem:
             return False, f"Couldn't process this image: {str(e)}"
 
     def register_student_face(self, image_path, student_id, name, roll=None):
-        """Registers (or re-registers) a student's face, keyed by their real
-        database student_id. Called from the profile-photo-upload endpoint."""
         safe_path = os.path.join(self.known_students_dir, f"{student_id}.jpg")
         if image_path != safe_path:
             image = face_recognition.load_image_file(image_path)
@@ -251,7 +236,7 @@ class ClassroomAttendanceSystem:
         a_area = ClassroomAttendanceSystem._box_area(a_top, a_right, a_bottom, a_left)
         b_area = ClassroomAttendanceSystem._box_area(b_top, b_right, b_bottom, b_left)
         union = a_area + b_area - inter_area
-        return union > 0 and (inter_area / union) >= 0.35
+        return union > 0 and (inter_area / union) >= 0.30
 
     def _merge_face_locations(self, locations):
         """Deduplicate overlapping detections, keeping the largest box."""
@@ -262,17 +247,10 @@ class ClassroomAttendanceSystem:
         return unique
 
     def _scale_locations(self, locations, scale):
-        if scale == 1.0:
+        if abs(scale - 1.0) < 1e-5:
             return locations
-        inv = 1.0 / scale
         return [
-            (int(top * inv), int(right * inv), int(bottom * inv), int(left * inv))
-            for top, right, bottom, left in locations
-        ]
-
-    def _offset_locations(self, locations, offset_y, offset_x):
-        return [
-            (top - offset_y, right - offset_x, bottom - offset_y, left - offset_x)
+            (int(round(top * scale)), int(round(right * scale)), int(round(bottom * scale)), int(round(left * scale)))
             for top, right, bottom, left in locations
         ]
 
@@ -282,16 +260,15 @@ class ClassroomAttendanceSystem:
         longest = max(h, w)
         if longest <= max_edge:
             return rgb_image, 1.0
-        scale = max_edge / longest
+        scale = max_edge / float(longest)
         resized = cv2.resize(
             rgb_image,
-            (int(w * scale), int(h * scale)),
+            (int(round(w * scale)), int(round(h * scale))),
             interpolation=cv2.INTER_AREA,
         )
         return resized, scale
 
     def prepare_known_faces(self, db_encoding_rows=None, allowed_student_ids=None):
-        """Load only the embeddings needed for this recognition request."""
         self.known_face_encodings = []
         self.known_face_ids = []
         self.known_face_names = []
@@ -321,104 +298,99 @@ class ClassroomAttendanceSystem:
             self._register_encoding(filepath, student_id, name)
 
     def _filter_face_locations(self, locations, img_h, img_w):
-        """Drop out-of-bounds boxes, padding artefacts, and non-face-sized regions."""
         img_area = img_h * img_w
-        min_h = max(16, int(img_h * 0.012))
-        min_area = min_h * min_h * 0.45
-        max_area = img_area * 0.2
+        min_dim = max(18, int(min(img_h, img_w) * 0.015))
+        min_area = min_dim * min_dim * 0.5
+        max_area = img_area * 0.25
+
         filtered = []
         for top, right, bottom, left in locations:
-            top = int(top)
-            right = int(right)
-            bottom = int(bottom)
-            left = int(left)
-            if top < 0 or left < 0 or bottom > img_h or right > img_w:
-                continue
-            if bottom <= top or right <= left:
-                continue
+            top = max(0, int(top))
+            left = max(0, int(left))
+            bottom = min(img_h, int(bottom))
+            right = min(img_w, int(right))
+
             height = bottom - top
             width = right - left
-            if height < min_h or width < max(12, int(min_h * 0.55)):
+            if height < min_dim or width < min_dim * 0.6:
                 continue
             area = height * width
             if area < min_area or area > max_area:
                 continue
-            aspect = width / height
-            if aspect < 0.45 or aspect > 2.2:
+            aspect = width / float(height)
+            if aspect < 0.5 or aspect > 1.8:
                 continue
             filtered.append((top, right, bottom, left))
         return filtered
 
-    def _choose_detect_edge(self, rgb_image):
-        h, w = rgb_image.shape[:2]
-        if h * w >= LARGE_IMAGE_PIXELS:
-            return MAX_DETECT_EDGE_LARGE
-        return MAX_DETECT_EDGE
-
     def _detect_face_locations(self, rgb_image):
-        """Memory-safe detection with adaptive resolution for large group photos."""
+        """
+        High-accuracy detection for group photos:
+        Detects faces across full image and half-grid crops to catch distant/small faces.
+        """
         h, w = rgb_image.shape[:2]
-        detect_edge = self._choose_detect_edge(rgb_image)
-        collected: list = []
+        collected = []
 
-        for edge in dict.fromkeys((detect_edge, MAX_DETECT_EDGE_LARGE)):
-            detect_img, det_scale = self._downscale_rgb(rgb_image, edge)
-            inv_scale = 1.0 / det_scale
+        # 1. Full image pass at high resolution
+        detect_img, det_scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE_LARGE)
+        inv_scale = 1.0 / det_scale
 
-            for upsample in (1, 2):
-                batch = face_recognition.face_locations(
-                    detect_img,
-                    number_of_times_to_upsample=upsample,
-                )
-                collected.extend(self._scale_locations(batch, inv_scale))
-                merged = self._filter_face_locations(
-                    self._merge_face_locations(collected), h, w
-                )
-                if len(merged) >= 4:
-                    del detect_img
-                    gc.collect()
-                    print(f"Detected {len(merged)} face(s) at edge={edge}, upsample={upsample}.")
-                    return merged
+        batch = face_recognition.face_locations(detect_img, number_of_times_to_upsample=1, model="hog")
+        collected.extend(self._scale_locations(batch, inv_scale))
 
-            del detect_img
+        # 2. Quadrant/Grid Scan for dense crowd detection (2x2 overlapping tiles)
+        # This gives high effective resolution for small faces without exhausting RAM
+        if max(h, w) > 1200:
+            tile_h, tile_w = int(h * 0.6), int(w * 0.6)
+            step_y, step_x = int(h * 0.4), int(w * 0.4)
+
+            for y0 in range(0, h, step_y):
+                for x0 in range(0, w, step_x):
+                    y1 = min(h, y0 + tile_h)
+                    x1 = min(w, x0 + tile_w)
+                    crop = rgb_image[y0:y1, x0:x1]
+                    crop_small, crop_scale = self._downscale_rgb(crop, 1280)
+                    tile_inv = 1.0 / crop_scale
+
+                    tile_faces = face_recognition.face_locations(crop_small, number_of_times_to_upsample=1, model="hog")
+                    for top, right, bottom, left in tile_faces:
+                        orig_top = int(top * tile_inv) + y0
+                        orig_right = int(right * tile_inv) + x0
+                        orig_bottom = int(bottom * tile_inv) + y0
+                        orig_left = int(left * tile_inv) + x0
+                        collected.append((orig_top, orig_right, orig_bottom, left + x0))
 
         merged = self._filter_face_locations(self._merge_face_locations(collected), h, w)
         gc.collect()
-        print(f"Detected {len(merged)} face(s) after filtered multi-pass detection.")
+        print(f"Total valid faces detected: {len(merged)}")
         return merged
 
     def _encode_face_at_location(self, rgb_image, location):
         top, right, bottom, left = location
-        top = max(0, int(top))
-        left = max(0, int(left))
-        bottom = min(rgb_image.shape[0], int(bottom))
-        right = min(rgb_image.shape[1], int(right))
-        location = (top, right, bottom, left)
+        h, w = rgb_image.shape[:2]
+        
+        # Add 10% padding around face box for better facial landmark/encoding quality
+        pad_y = int((bottom - top) * 0.1)
+        pad_x = int((right - left) * 0.1)
+        
+        c_top = max(0, top - pad_y)
+        c_left = max(0, left - pad_x)
+        c_bottom = min(h, bottom + pad_y)
+        c_right = min(w, right + pad_x)
 
-        encodings = face_recognition.face_encodings(
-            rgb_image,
-            [location],
-            num_jitters=1,
-        )
+        crop = rgb_image[c_top:c_bottom, c_left:c_right]
+        if crop.shape[0] < 10 or crop.shape[1] < 10:
+            return None
+
+        # Detect landmark inside the cropped region
+        crop_loc = (pad_y, crop.shape[1] - pad_x, crop.shape[0] - pad_y, pad_x)
+        encodings = face_recognition.face_encodings(crop, [crop_loc], num_jitters=1)
         if encodings:
             return encodings[0]
 
-        work_image, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE_LARGE)
-        if scale != 1.0:
-            scaled_location = (
-                int(top * scale),
-                int(right * scale),
-                int(bottom * scale),
-                int(left * scale),
-            )
-            encodings = face_recognition.face_encodings(
-                work_image,
-                [scaled_location],
-                num_jitters=1,
-            )
-            if encodings:
-                return encodings[0]
-        return None
+        # Fallback to direct location
+        encodings = face_recognition.face_encodings(rgb_image, [location], num_jitters=1)
+        return encodings[0] if encodings else None
 
     def _assign_faces_to_students(
         self,
@@ -427,11 +399,10 @@ class ClassroomAttendanceSystem:
         allowed_set: set | None,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> dict[int, tuple[int | None, str, float]]:
-        """One enrolled student can match at most one face; weak matches become Unknown."""
         candidates: list[tuple[int, int, str, float, float]] = []
 
         for face_index, encoding in face_encodings_by_index.items():
-            if encoding is None:
+            if encoding is None or not self.known_face_encodings:
                 continue
             distances = face_recognition.face_distance(self.known_face_encodings, encoding)
             for idx in np.argsort(distances):
@@ -473,51 +444,19 @@ class ClassroomAttendanceSystem:
 
         return assignments
 
-    def _match_face(self, face_encoding, tolerance, allowed_set=None):
-        """Pick the closest known face within tolerance; when section-scoped,
-        skip matches for students outside the allowed enrollment set."""
-        if not self.known_face_encodings:
-            return None, "Unknown", 0.0
-
-        distances = face_recognition.face_distance(
-            self.known_face_encodings, face_encoding
-        )
-        for idx in np.argsort(distances):
-            distance = float(distances[idx])
-            if distance > tolerance:
-                break
-            student_id = self.known_face_ids[idx]
-            if allowed_set is not None and student_id not in allowed_set:
-                continue
-            name = self.known_face_names[idx]
-            return student_id, name, 1 - distance
-        return None, "Unknown", 0.0
-
     def recognize_classroom(
         self,
         classroom_image_path,
-        tolerance=0.65,
+        tolerance=0.55,
         allowed_student_ids=None,
         db_encoding_rows=None,
     ):
-        """Recognize students in a classroom image. Returns student_id (real
-        database id) for every match, not just a name string.
-
-        When allowed_student_ids is provided, only students enrolled in the
-        target section can be matched — others appear as unknown faces."""
-        # Load only section-scoped embeddings — avoid reloading every student photo.
         self.prepare_known_faces(
             db_encoding_rows=db_encoding_rows,
             allowed_student_ids=allowed_student_ids,
         )
 
         has_registered_faces = bool(self.known_face_encodings)
-        if not has_registered_faces:
-            print(
-                "No registered face embeddings — running detection-only mode "
-                "(faces will appear as Unknown until students upload profile photos)."
-            )
-
         allowed_set = set(allowed_student_ids) if allowed_student_ids else None
 
         enrolled_with_faces = []
@@ -525,10 +464,6 @@ class ClassroomAttendanceSystem:
             enrolled_with_faces = [
                 sid for sid in allowed_set if sid in self.known_face_ids
             ]
-            print(
-                f"Section scope: {len(allowed_set)} enrolled, "
-                f"{len(enrolled_with_faces)} with registered face photos."
-            )
 
         print("Analyzing classroom image...")
 
@@ -563,9 +498,7 @@ class ClassroomAttendanceSystem:
             name = "Unknown"
             confidence = 0.0
 
-            if face_encoding is None:
-                unknown_faces += 1
-            elif not has_registered_faces:
+            if face_encoding is None or not has_registered_faces:
                 unknown_faces += 1
             else:
                 student_id, name, confidence = assignments.get(
@@ -588,17 +521,27 @@ class ClassroomAttendanceSystem:
             })
 
             color = (0, 255, 0) if student_id is not None else (0, 0, 255)
-            cv2.rectangle(classroom_image_cv, (left, top), (right, bottom), color, 2)
+            # Draw rectangle (left, top) -> (right, bottom)
+            cv2.rectangle(classroom_image_cv, (left, top), (right, bottom), color, 3)
+
             label = f"{name} ({confidence:.0%})" if student_id is not None else "Unknown"
+            
+            # Label background header
+            label_y = max(top - 10, 25)
+            (w_txt, h_txt), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.6, 1)
             cv2.rectangle(
-                classroom_image_cv, (left, bottom - 35), (right, bottom), color, cv2.FILLED
+                classroom_image_cv, 
+                (left, label_y - h_txt - 6), 
+                (left + w_txt + 8, label_y + 4), 
+                color, 
+                cv2.FILLED
             )
             cv2.putText(
                 classroom_image_cv,
                 label,
-                (left + 6, bottom - 6),
+                (left + 4, label_y - 2),
                 cv2.FONT_HERSHEY_DUPLEX,
-                0.5,
+                0.6,
                 (255, 255, 255),
                 1,
             )
@@ -629,9 +572,7 @@ class ClassroomAttendanceSystem:
             "warning_message": (
                 None
                 if has_registered_faces
-                else "No enrolled students have profile photos registered on the server. "
-                "Faces were detected but all are marked Unknown — ask each student to "
-                "upload their profile photo, then try again."
+                else "No enrolled students have profile photos registered on the server."
             ),
             "face_details": face_details,
         }
