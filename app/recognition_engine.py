@@ -283,86 +283,244 @@ class ClassroomAttendanceSystem:
                 result.append((orig_top, orig_right, orig_bottom, orig_left))
         return result
 
-    def _detect_face_locations(self, rgb_image):
-        """Detect faces reliably in group photos, including smaller/background faces.
+    @staticmethod
+    def _box_iou(a, b):
+        at, ar, ab, al = a
+        bt, br, bb, bl = b
+        top = max(at, bt)
+        left = max(al, bl)
+        bottom = min(ab, bb)
+        right = min(ar, br)
+        inter_w = max(0, right - left)
+        inter_h = max(0, bottom - top)
+        inter = inter_w * inter_h
+        if inter == 0:
+            return 0.0
+        area_a = max(0, ar - al) * max(0, ab - at)
+        area_b = max(0, br - bl) * max(0, bb - bt)
+        union = area_a + area_b - inter
+        return inter / union if union else 0.0
 
-        The normal HOG pass is kept as the fast path. If it returns a small number
-        of faces, a second upsampled pass is run on a smaller copy of the image.
-        Detections are merged by IoU so the same face is never returned twice.
+    @staticmethod
+    def _rotate_image(rgb_image, angle):
+        """Rotate an RGB image without changing its content size unexpectedly."""
+        if angle == 90:
+            return cv2.rotate(rgb_image, cv2.ROTATE_90_CLOCKWISE)
+        if angle == -90:
+            return cv2.rotate(rgb_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if angle == 180:
+            return cv2.rotate(rgb_image, cv2.ROTATE_180)
+
+        h, w = rgb_image.shape[:2]
+        center = (w / 2.0, h / 2.0)
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        cos = abs(matrix[0, 0])
+        sin = abs(matrix[0, 1])
+        new_w = int((h * sin) + (w * cos))
+        new_h = int((h * cos) + (w * sin))
+        matrix[0, 2] += (new_w / 2.0) - center[0]
+        matrix[1, 2] += (new_h / 2.0) - center[1]
+        return cv2.warpAffine(
+            rgb_image,
+            matrix,
+            (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+    @staticmethod
+    def _map_rotated_box_to_original(box, angle, original_shape):
+        """Map a box from a rotated image back to original top/right/bottom/left."""
+        top, right, bottom, left = box
+        h, w = original_shape[:2]
+        corners = np.array(
+            [[left, top], [right, top], [right, bottom], [left, bottom]],
+            dtype=np.float32,
+        )
+
+        if angle == 90:
+            # Inverse of clockwise rotation: x = y', y = h - x'.
+            mapped = np.column_stack((corners[:, 1], h - corners[:, 0]))
+        elif angle == -90:
+            # Inverse of counter-clockwise rotation: x = w - y', y = x'.
+            mapped = np.column_stack((w - corners[:, 1], corners[:, 0]))
+        elif angle == 180:
+            mapped = np.column_stack((w - corners[:, 0], h - corners[:, 1]))
+        else:
+            # For arbitrary rotations the detector is only used as a fallback.
+            # Re-running on a rotated image is still useful, but exact inverse
+            # mapping is required for the resulting rectangle.
+            radians = np.deg2rad(-angle)
+            c, s = np.cos(radians), np.sin(radians)
+            center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+            rotation = np.array([[c, -s], [s, c]], dtype=np.float32)
+            mapped = (corners - center) @ rotation.T + center
+
+        xs = mapped[:, 0]
+        ys = mapped[:, 1]
+        return (
+            max(0, int(round(ys.min()))),
+            min(w, int(round(xs.max()))),
+            min(h, int(round(ys.max()))),
+            max(0, int(round(xs.min()))),
+        )
+
+    def _scale_locations_to_original(self, locations, scale, width, height):
+        inv_scale = 1.0 / scale
+        result = []
+        for top, right, bottom, left in locations:
+            orig_top = max(0, int(round(top * inv_scale)))
+            orig_right = min(width, int(round(right * inv_scale)))
+            orig_bottom = min(height, int(round(bottom * inv_scale)))
+            orig_left = max(0, int(round(left * inv_scale)))
+            if orig_bottom > orig_top + 15 and orig_right > orig_left + 15:
+                result.append((orig_top, orig_right, orig_bottom, orig_left))
+        return result
+
+    def _detect_face_locations(self, rgb_image):
+        """Multi-pass detector for group photos and non-upright faces.
+
+        HOG remains the fast primary detector. We then add a smaller, upsampled
+        HOG pass, OpenCV frontal/profile cascades, and rotated HOG passes. The
+        rotated passes are important for phones/photos where a person's head is
+        tilted sideways or the whole image is slightly rotated.
         """
         h, w = rgb_image.shape[:2]
         detect_img, scale = self._downscale_rgb(rgb_image, MAX_DETECT_EDGE)
         primary = face_recognition.face_locations(
-            detect_img,
-            number_of_times_to_upsample=1,
-            model="hog",
+            detect_img, number_of_times_to_upsample=1, model="hog"
         )
-        full_locations = self._scale_locations_to_original(
-            primary, scale, w, h
-        )
+        full_locations = self._scale_locations_to_original(primary, scale, w, h)
 
-        # Three-person detection in a larger group is a common failure mode: the
-        # smaller/further-away face is often missed by the first HOG pass.
-        # Re-run only when the result is likely incomplete, keeping normal captures fast.
+        def add_boxes(boxes, iou_threshold=0.30):
+            for box in boxes:
+                if not any(self._box_iou(box, existing) >= iou_threshold for existing in full_locations):
+                    full_locations.append(box)
+
+        # Higher sensitivity for small/far-away faces.
         if len(full_locations) < 6:
-            sensitive_img, sensitive_scale = self._downscale_rgb(
-                rgb_image, SECOND_PASS_DETECT_EDGE
-            )
+            sensitive_img, sensitive_scale = self._downscale_rgb(rgb_image, SECOND_PASS_DETECT_EDGE)
             try:
                 secondary = face_recognition.face_locations(
-                    sensitive_img,
-                    number_of_times_to_upsample=SECOND_PASS_UPSAMPLE,
-                    model="hog",
+                    sensitive_img, number_of_times_to_upsample=SECOND_PASS_UPSAMPLE, model="hog"
                 )
-                secondary_full = self._scale_locations_to_original(
-                    secondary, sensitive_scale, w, h
+                add_boxes(
+                    self._scale_locations_to_original(secondary, sensitive_scale, w, h),
+                    iou_threshold=0.35,
                 )
-                for box in secondary_full:
-                    if not any(self._box_iou(box, existing) >= 0.35 for existing in full_locations):
-                        full_locations.append(box)
             except Exception as e:
-                # The first pass is still a valid result if the more expensive
-                # sensitivity pass cannot run.
                 print(f"Secondary face detection skipped: {e}")
 
-        # OpenCV's lightweight frontal-face detector is a final safety net for
-        # the occasional small face that HOG still misses. It is only used when
-        # fewer than four faces were found, and candidates are restricted to a
-        # plausible upper-image face region to avoid adding body/background boxes.
-        if len(full_locations) < 4:
-            try:
-                gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
-                cascade = cv2.CascadeClassifier(
-                    os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-                )
-                haar_boxes = cascade.detectMultiScale(
+        # Haar cascades are deliberately used as a candidate generator rather than
+        # the primary detector. They are very good at recovering frontal/profile
+        # faces that HOG occasionally misses, but can also produce body/background
+        # false positives, so candidates are size/position filtered and merged.
+        try:
+            gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+            gray = cv2.equalizeHist(gray)
+            cascade_files = (
+                "haarcascade_frontalface_default.xml",
+                "haarcascade_frontalface_alt2.xml",
+                "haarcascade_profileface.xml",
+            )
+            for cascade_file in cascade_files:
+                cascade = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, cascade_file))
+                if cascade.empty():
+                    continue
+                boxes = cascade.detectMultiScale(
                     gray,
                     scaleFactor=1.08,
-                    minNeighbors=5,
+                    minNeighbors=5 if "profile" not in cascade_file else 4,
                     minSize=(40, 40),
                 )
-                for x, y, box_w, box_h in haar_boxes:
-                    # Ignore obvious lower-body false positives; real classroom
-                    # faces in this capture are in the upper part of the image.
+                candidates = []
+                for x, y, box_w, box_h in boxes:
                     center_y = y + box_h / 2.0
-                    if (
-                        center_y > h * 0.65
-                        or box_w < 40
-                        or box_h < 40
-                        or max(box_w, box_h) > 180
-                    ):
+                    aspect = box_w / float(max(box_h, 1))
+                    # Classroom faces are expected in the upper/middle area. Keep
+                    # a generous range so seated/shorter students are not excluded.
+                    if center_y > h * 0.78:
                         continue
-                    box = (y, x + box_w, y + box_h, x)
-                    if not any(self._box_iou(box, existing) >= 0.25 for existing in full_locations):
-                        full_locations.append(box)
-            except Exception as e:
-                print(f"OpenCV face-detection fallback skipped: {e}")
+                    if box_w < 40 or box_h < 40 or box_w > w * 0.30 or box_h > h * 0.30:
+                        continue
+                    if aspect < 0.60 or aspect > 1.65:
+                        continue
+                    candidates.append((y, x + box_w, y + box_h, x))
+                add_boxes(candidates, iou_threshold=0.25)
+        except Exception as e:
+            print(f"OpenCV face-detection fallback skipped: {e}")
 
-        # Stable top-to-bottom/left-to-right order makes face indices predictable
-        # and keeps the UI from jumping when two detection passes are merged.
+        # Run HOG on rotated versions only when the normal detector is still likely
+        # incomplete. This catches tilted/sideways faces without making every
+        # classroom capture pay the cost of several extra passes.
+        if len(full_locations) < 4:
+            for angle in (90, -90, 180):
+                try:
+                    rotated = self._rotate_image(rgb_image, angle)
+                    rotated_small, rotated_scale = self._downscale_rgb(rotated, 1400)
+                    rotated_locations = face_recognition.face_locations(
+                        rotated_small, number_of_times_to_upsample=1, model="hog"
+                    )
+                    # First map from rotated-small coordinates back to rotated image,
+                    # then map those coordinates back to the original image.
+                    rotated_full = self._scale_locations_to_original(
+                        rotated_locations, rotated_scale, rotated.shape[1], rotated.shape[0]
+                    )
+                    mapped = [
+                        self._map_rotated_box_to_original(box, angle, rgb_image.shape)
+                        for box in rotated_full
+                    ]
+                    add_boxes(mapped, iou_threshold=0.25)
+                except Exception as e:
+                    print(f"Rotated HOG pass ({angle}°) skipped: {e}")
+
         full_locations.sort(key=lambda box: (box[0], box[3]))
         print(f"Detected {len(full_locations)} face(s) in image.")
         return full_locations
+
+    def _orientation_fallback_encoding(self, rgb_image, location):
+        """Try to encode a difficult face after normalizing its orientation.
+
+        This is intentionally a fallback for faces that HOG/landmark encoding cannot
+        match. It avoids running expensive multi-angle encoding on every face.
+        """
+        top, right, bottom, left = location
+        h, w = rgb_image.shape[:2]
+        pad_y = max(12, int((bottom - top) * 0.45))
+        pad_x = max(12, int((right - left) * 0.45))
+        top = max(0, top - pad_y)
+        left = max(0, left - pad_x)
+        bottom = min(h, bottom + pad_y)
+        right = min(w, right + pad_x)
+        crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
+        if crop.size == 0:
+            return None
+
+        best = None
+        for angle in (0, 90, -90, 180):
+            try:
+                rotated = self._rotate_image(crop, angle)
+                rotated, _ = self._downscale_rgb(rotated, 700)
+                locations = face_recognition.face_locations(
+                    rotated, number_of_times_to_upsample=1, model="hog"
+                )
+                if not locations:
+                    continue
+                # Pick the largest detected face in the padded crop.
+                chosen = max(
+                    locations,
+                    key=lambda b: max(0, b[2] - b[0]) * max(0, b[1] - b[3]),
+                )
+                encodings = face_recognition.face_encodings(
+                    rotated, [chosen], num_jitters=2
+                )
+                if encodings:
+                    best = encodings[0]
+                    if angle == 0:
+                        break
+            except Exception:
+                continue
+        return best
 
     def _assign_faces_to_students(
         self,
@@ -458,6 +616,38 @@ class ClassroomAttendanceSystem:
                 tolerance=tolerance,
                 allowed_set=allowed_set,
             )
+
+            # If a detected face was not recognized, retry that face using a
+            # padded crop rotated through 0/90/-90/180 degrees. This is the
+            # important second stage for sideways/tilted/downward-looking faces:
+            # detection and recognition are separate problems, and a good box can
+            # still produce poor landmarks when the head is not upright.
+            difficult_faces = [
+                idx for idx, assignment in assignments.items()
+                if assignment[0] is None
+            ]
+            for face_index in difficult_faces:
+                location = face_locations[face_index]
+                fallback_encoding = self._orientation_fallback_encoding(
+                    classroom_image, location
+                )
+                if fallback_encoding is None:
+                    continue
+                retry = self._assign_faces_to_students(
+                    {face_index: fallback_encoding},
+                    tolerance=tolerance,
+                    allowed_set=allowed_set,
+                )
+                if retry.get(face_index, (None, "Unknown", 0.0))[0] is not None:
+                    candidate = retry[face_index]
+                    # Do not replace a stronger match for another face with the
+                    # same student. The normal global assignment remains primary.
+                    already_used = any(
+                        value[0] == candidate[0] and idx != face_index
+                        for idx, value in assignments.items()
+                    )
+                    if not already_used:
+                        assignments[face_index] = candidate
 
         present_student_ids = []
         unknown_faces = 0
