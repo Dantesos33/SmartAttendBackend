@@ -429,73 +429,7 @@ class ClassroomAttendanceSystem:
         except Exception:
             return "clear"
 
-    def _has_upper_face_visible(self, rgb_image, location):
-        """Post-detection gate: reject lower-face-only detections.
-
-        YuNet/OpenCV detection itself is never changed. A detected candidate is
-        retained only when there is meaningful evidence that its upper face is
-        visible. This allows masked faces to continue into recognition as
-        Unrecognized while removing detections that contain only a mouth/chin/
-        lower-face region.
-        """
-        top, right, bottom, left = [int(v) for v in location]
-        h, w = rgb_image.shape[:2]
-        top = max(0, min(top, h - 1))
-        bottom = max(top + 1, min(bottom, h))
-        left = max(0, min(left, w - 1))
-        right = max(left + 1, min(right, w))
-
-        crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
-        ch, cw = crop.shape[:2]
-        if ch < 24 or cw < 20:
-            return False
-
-        # Upscale only the post-detection crop for visibility analysis.
-        scale = min(4.0, 180.0 / max(ch, cw))
-        work = cv2.resize(crop, None, fx=scale, fy=scale,
-                          interpolation=cv2.INTER_CUBIC) if scale > 1.0 else crop
-
-        wh, ww = work.shape[:2]
-        upper = work[int(wh * 0.05):int(wh * 0.62),
-                     int(ww * 0.05):int(ww * 0.95)]
-        lower = work[int(wh * 0.45):int(wh * 0.95),
-                     int(ww * 0.05):int(ww * 0.95)]
-
-        if upper.size == 0:
-            return False
-
-        # Facial landmarks are the strongest evidence that the upper face is
-        # actually present. Eyes OR nose/brow structure is enough.
-        try:
-            lm = face_recognition.face_landmarks(work, model="large")
-            if lm:
-                points = lm[0]
-                upper_parts = (
-                    bool(points.get("left_eye")) or
-                    bool(points.get("right_eye")) or
-                    bool(points.get("nose_bridge")) or
-                    bool(points.get("nose_tip")) or
-                    bool(points.get("left_eyebrow")) or
-                    bool(points.get("right_eyebrow"))
-                )
-                if upper_parts:
-                    return True
-        except Exception:
-            pass
-
-        # Conservative image-structure fallback for small/side-facing faces
-        # where landmarks fail. Lower-face-only crops tend to have substantially
-        # more useful structure below the midline than above it.
-        upper_gray = cv2.cvtColor(upper, cv2.COLOR_RGB2GRAY)
-        lower_gray = cv2.cvtColor(lower, cv2.COLOR_RGB2GRAY) if lower.size else upper_gray
-        upper_edges = cv2.Canny(upper_gray, 50, 150)
-        lower_edges = cv2.Canny(lower_gray, 50, 150)
-        upper_ratio = float(np.mean(upper_edges > 0))
-        lower_ratio = float(np.mean(lower_edges > 0))
-
-        return upper_ratio >= 0.012 and upper_ratio >= lower_ratio * 0.38
-
-    def _downscale_rgb(rgb_image, max_edge):
+    def _downscale_rgb(self, rgb_image, max_edge):
         h, w = rgb_image.shape[:2]
         longest = max(h, w)
         if longest <= max_edge:
@@ -860,19 +794,9 @@ class ClassroomAttendanceSystem:
         classroom_image = np.ascontiguousarray(classroom_image)
         classroom_image_cv = cv2.cvtColor(classroom_image, cv2.COLOR_RGB2BGR)
 
-        # Stage 1 remains completely unchanged. Only after YuNet/OpenCV has
-        # produced its candidate boxes do we remove lower-face-only candidates.
-        raw_face_locations = self._detect_face_locations(classroom_image)
-        face_locations = [
-            location for location in raw_face_locations
-            if self._has_upper_face_visible(classroom_image, location)
-        ]
-        print(
-            f"Post-detection upper-face filter: {len(face_locations)} of "
-            f"{len(raw_face_locations)} candidate face(s) retained."
-        )
+        face_locations = self._detect_face_locations(classroom_image)
 
-        # Batch encode all remaining faces safely
+        # Batch encode all detected faces safely
         face_encodings_by_index = {}
         if face_locations:
             try:
