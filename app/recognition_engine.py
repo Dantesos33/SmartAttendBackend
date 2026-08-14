@@ -296,98 +296,104 @@ class ClassroomAttendanceSystem:
 
 
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
-        """Conservative Stage-2 mask/occlusion classifier.
+        """Stage-2 mask/occlusion classification only.
 
-        IMPORTANT: this function does not perform detection. Stage-1 locations are
-        passed in unchanged. Recognition availability must also not automatically
-        make a face "clear": masked students can still produce an embedding.
+        Detection is intentionally NOT performed here.  The detector has a
+        protected baseline and this method only decides whether an already
+        detected face has strong evidence of lower-face covering.
 
-        A face is marked masked only when there is actual lower-face occlusion
-        evidence. Ordinary profile/downward/low-resolution faces remain clear and
-        can continue to enrollment matching.
+        The classifier uses several independent cues and a small landmark
+        upscale pass.  This is deliberately conservative: one weak cue must
+        never turn a normal face into ``masked``.
         """
         top, right, bottom, left = [int(x) for x in location]
         h, w = rgb_image.shape[:2]
-        top = max(0, top); left = max(0, left)
-        bottom = min(h, bottom); right = min(w, right)
+        top, left = max(0, top), max(0, left)
+        bottom, right = min(h, bottom), min(w, right)
         if bottom <= top or right <= left:
             return "clear"
 
         crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
         ch, cw = crop.shape[:2]
-        if ch < 48 or cw < 32:
-            # Tiny faces are intentionally never classified as masked from weak
-            # image statistics. They remain clear/unrecognized.
+        if ch < 36 or cw < 24:
             return "clear"
 
         try:
             gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-            # Focus on the facial area; ignore the very top hair/background and
-            # the bottom shirt/background region.
-            upper = gray[int(ch * 0.16):int(ch * 0.50), int(cw * 0.10):int(cw * 0.90)]
-            lower = gray[int(ch * 0.50):int(ch * 0.88), int(cw * 0.10):int(cw * 0.90)]
+            upper = gray[int(ch * 0.15):int(ch * 0.52), int(cw * 0.08):int(cw * 0.92)]
+            lower = gray[int(ch * 0.48):int(ch * 0.90), int(cw * 0.08):int(cw * 0.92)]
             if upper.size == 0 or lower.size == 0:
                 return "clear"
 
-            upper_mean = float(np.mean(upper))
-            lower_mean = float(np.mean(lower))
-            upper_std = float(np.std(upper))
-            lower_std = float(np.std(lower))
+            upper_mean, lower_mean = float(np.mean(upper)), float(np.mean(lower))
+            upper_std, lower_std = float(np.std(upper)), float(np.std(lower))
+            ue = cv2.Canny(upper, 50, 130)
+            le = cv2.Canny(lower, 50, 130)
+            upper_edges = float(np.mean(ue > 0))
+            lower_edges = float(np.mean(le > 0))
 
-            # Edge density is useful because fabric masks/niqabs tend to make the
-            # lower face relatively uniform while a visible mouth/chin has more
-            # local structure. This is only a supporting signal.
-            upper_edges = cv2.Canny(upper, 60, 140)
-            lower_edges = cv2.Canny(lower, 60, 140)
-            upper_edge_density = float(np.mean(upper_edges > 0))
-            lower_edge_density = float(np.mean(lower_edges > 0))
+            # Landmarks are unreliable on tiny classroom faces at native size.
+            # Upscale only this small crop; this does not affect Stage-1 detection.
+            landmark_crop = crop
+            if max(ch, cw) < 180:
+                scale = min(4.0, 180.0 / max(ch, cw))
+                landmark_crop = cv2.resize(
+                    crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+                )
 
             landmarks = {}
             try:
-                lm = face_recognition.face_landmarks(crop, model="large")
+                lm = face_recognition.face_landmarks(landmark_crop, model="large")
                 if lm:
                     landmarks = lm[0]
             except Exception:
                 landmarks = {}
 
-            has_both_eyes = bool(landmarks.get("left_eye")) and bool(landmarks.get("right_eye"))
-            has_mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
-            has_nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
+            eyes = bool(landmarks.get("left_eye")) and bool(landmarks.get("right_eye"))
+            mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
+            nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
 
-            # Strong mask/niqab signal:
-            # - eyes are visible, while mouth is absent, AND
-            # - lower face is unusually uniform OR substantially less detailed.
-            eye_only_occlusion = (
-                has_both_eyes and
-                not has_mouth and
-                (lower_std < max(upper_std * 0.78, 10.0) or
-                 lower_edge_density < max(upper_edge_density * 0.58, 0.018))
+            # Score independent signals instead of relying on one brittle rule.
+            score = 0
+
+            # Eyes visible but mouth structure missing is a strong occlusion cue.
+            if eyes and not mouth:
+                score += 2
+
+            # If eyes are visible but both mouth and nose structure are absent,
+            # this is particularly useful for niqab/face-covering cases.
+            if eyes and not mouth and not nose:
+                score += 2
+
+            # Covered lower faces are commonly flatter/less textured than the
+            # upper face.  Require a meaningful relative difference, not a fixed
+            # brightness threshold so lighting/skin tone do not dominate.
+            texture_flat = (
+                lower_std < max(upper_std * 0.78, 9.0) and
+                lower_edges < max(upper_edges * 0.72, 0.016)
             )
+            if texture_flat:
+                score += 1
 
-            # Strong fabric/occlusion signal even if landmarks are incomplete.
-            # Requiring both intensity and texture differences avoids classifying
-            # ordinary shadows, sideways faces, or low-resolution faces as masks.
-            dark_flat_lower = (
+            # A dark/opaque lower covering is an additional cue, but it is never
+            # sufficient by itself because shadows and hair can look similar.
+            dark_cover = (
                 upper_mean > 45 and
-                lower_mean < upper_mean * 0.68 and
-                lower_std < max(upper_std * 0.72, 10.0) and
-                lower_edge_density < max(upper_edge_density * 0.62, 0.020)
+                lower_mean < upper_mean * 0.72 and
+                lower_std < max(upper_std * 0.82, 9.0)
             )
+            if dark_cover:
+                score += 1
 
-            # A niqab can cover most of the lower face without being particularly
-            # dark. In that case the reliable signal is visible eyes + missing
-            # mouth/nose structure + low lower-face detail.
-            niqab_like = (
-                has_both_eyes and
-                not has_mouth and
-                not has_nose and
-                lower_std < max(upper_std * 0.88, 12.0) and
-                lower_edge_density < max(upper_edge_density * 0.72, 0.022)
-            )
+            # Very low lower-face detail combined with visible eyes is useful for
+            # masks/niqabs even when the landmark detector only finds the eyes.
+            if eyes and lower_edges < max(upper_edges * 0.82, 0.018):
+                score += 1
 
-            if eye_only_occlusion or dark_flat_lower or niqab_like:
+            # Require strong evidence.  This reduces false positives on sideways,
+            # downward-facing and low-resolution clear faces.
+            if score >= 3:
                 return "masked"
-
             return "clear"
         except Exception:
             return "clear"
