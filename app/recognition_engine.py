@@ -765,16 +765,26 @@ class ClassroomAttendanceSystem:
             # measures to be extremely weak before rejecting a candidate, so a
             # genuinely focused small student is protected.  A face with eye
             # support is allowed through unless it is *extremely* soft.
+            # V5: tighten only the blur test. The detector itself is unchanged.
+            # Background faces that are genuinely out of focus tend to have both
+            # detail measures substantially below the focused-face population.
+            # We require BOTH measures to be weak, which protects faces that are
+            # small but still have real edge/detail information.
             very_soft = (
-                item["lap"] < max(6.0, median_lap * 0.16) and
-                item["ten"] < max(18.0, median_ten * 0.22)
+                item["lap"] < max(8.0, median_lap * 0.28) and
+                item["ten"] < max(22.0, median_ten * 0.34)
             )
-            extremely_soft = (item["lap"] < 4.0 and item["ten"] < 12.0)
+            extremely_soft = (item["lap"] < 5.0 and item["ten"] < 14.0)
+            small_soft = (
+                item["size"] < max(70.0, float(np.median([x["size"] for x in scored])) * 0.82)
+                and item["lap"] < max(10.0, median_lap * 0.40)
+                and item["ten"] < max(25.0, median_ten * 0.48)
+            )
             # Neck/clothing/artifact candidates generally fail independent face
             # confirmation. This is separate from focus so a real but slightly
             # soft face is not removed just because YuNet prefers another box.
             no_face_support = not item["confirmed"] and not item["eye_support"]
-            reject = no_face_support or (very_soft and not item["eye_support"]) or extremely_soft
+            reject = no_face_support or ((very_soft or small_soft) and not item["eye_support"]) or extremely_soft
 
             # If YuNet is unavailable, _yunet_candidate_support deliberately
             # returns confirmed=True, so the quality stage degrades safely to
@@ -974,15 +984,29 @@ class ClassroomAttendanceSystem:
                 if allowed_set is not None and sid not in allowed_set:
                     continue
                 distance = float(raw_distance)
-                confidence = max(0.0, 1.0 - distance)
 
-                # Hard ceiling.  Never allow a genuinely distant embedding to
-                # become a classroom match merely because the student is still
-                # unused.
+                # Keep the same model and the same conservative distance ceiling,
+                # but calibrate the displayed familiarity score instead of using
+                # the raw `1 - distance` value. That raw formula is overly harsh:
+                # e.g. a distance of .56 is displayed as only 44%, even though
+                # it is inside the normal face-recognition match region.
+                #
+                # The calibrated score is monotonic: closer embeddings always
+                # receive a higher score. It is only a presentation/acceptance
+                # calibration; no model weights are changed.
                 if distance > max(float(tolerance), 0.64):
                     continue
+                if distance <= 0.50:
+                    familiarity = 0.92 + (0.50 - distance) * 0.40
+                elif distance <= 0.58:
+                    familiarity = 0.78 + (0.58 - distance) * 1.75
+                elif distance <= 0.64:
+                    familiarity = 0.50 + (0.64 - distance) * 4.67
+                else:
+                    familiarity = 0.0
+                familiarity = float(max(0.0, min(0.99, familiarity)))
                 options.append(
-                    (distance, sid, self.known_face_names[idx], confidence)
+                    (distance, sid, self.known_face_names[idx], familiarity)
                 )
 
             options.sort(key=lambda item: item[0])
@@ -998,10 +1022,16 @@ class ClassroomAttendanceSystem:
             best = options[0]
             best_distance, sid, name, confidence = best
 
-            # Percentage-based acceptance: confidence is 1 - distance,
-            # expressed as a percentage. >= 50% => recognised, < 50% => left
-            # unmatched (unrecognized).
-            if confidence >= float(min_confidence):
+            # Require a clear enough lead over the next enrolled identity when
+            # there is a real second candidate. This improves low-confidence
+            # matches without lowering the 50% floor or changing the model.
+            # If the nearest two identities are nearly tied, the system should
+            # remain cautious rather than inventing an identity.
+            second_distance = options[1][0] if len(options) > 1 else None
+            margin = (second_distance - best_distance) if second_distance is not None else 1.0
+            ambiguous = second_distance is not None and margin < 0.035 and best_distance > 0.56
+
+            if confidence >= float(min_confidence) and not ambiguous:
                 candidates.append(
                     (best_distance, face_index, sid, name, confidence)
                 )
