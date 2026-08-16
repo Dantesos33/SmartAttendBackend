@@ -9,12 +9,14 @@ import json
 import urllib.request
 import threading
 
-MIN_CONFIDENCE = 0.45
+MIN_CONFIDENCE = 0.50
 MAX_DETECT_EDGE = 2000
 # Conservative quality gates for group photos. Small faces get a lower sharpness
 # requirement so the fourth student is not discarded just because they are farther away.
-MIN_FACE_SHARPNESS_LARGE = 18.0
-MIN_FACE_SHARPNESS_SMALL = 8.0
+MIN_FACE_SHARPNESS_LARGE = 16.0
+MIN_FACE_SHARPNESS_SMALL = 10.0
+FOCUS_GAP_RATIO = 1.35
+FOCUS_RELATIVE_MIN = 0.42
 YUNET_NORMAL_SCORE = 0.35
 YUNET_MASK_SCORE = 0.20
 MAX_ANNOTATED_EDGE = 1200
@@ -594,51 +596,96 @@ class ClassroomAttendanceSystem:
 
     @staticmethod
     def _focus_score(rgb_crop):
-        """Fast focus score using central-face Laplacian variance."""
+        """Scale-normalized face focus score.
+
+        The old Laplacian test was strongly biased by face size: a small blurred
+        background face could still pass simply because it contained hair/clothes
+        edges, while a small but focused student could score too low. Every face
+        is resized to the same analysis size and the score combines high-frequency
+        energy with edge density.
+        """
         if rgb_crop is None or rgb_crop.size == 0:
             return 0.0
         try:
             h, w = rgb_crop.shape[:2]
             if h < 12 or w < 12:
                 return 0.0
-            y0, y1 = int(h * 0.15), int(h * 0.88)
-            x0, x1 = int(w * 0.12), int(w * 0.88)
+            y0, y1 = int(h * 0.12), int(h * 0.88)
+            x0, x1 = int(w * 0.10), int(w * 0.90)
             crop = rgb_crop[y0:y1, x0:x1]
+            if crop.size == 0:
+                return 0.0
             gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-            # Slight blur suppresses JPEG/edge noise that can make tiny faces
-            # appear artificially sharp.
+            gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
             gray = cv2.GaussianBlur(gray, (3, 3), 0)
-            return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            grad = float(np.mean(np.sqrt(gx * gx + gy * gy)))
+            edges = cv2.Canny(gray, 60, 140)
+            edge_density = float(np.mean(edges > 0))
+            return 0.65 * lap + 0.25 * grad + 0.10 * (edge_density * 100.0)
         except Exception:
             return 0.0
 
     def _filter_face_locations_by_focus(self, rgb_image, locations):
-        """Remove only clearly out-of-focus detections.
+        """Filter background/blurred faces using normalized and relative focus.
 
-        Small faces receive a lower threshold. A small but genuinely sharp
-        fourth student therefore survives, while a large blurred/background
-        face is rejected.
+        A fixed blur threshold alone is unreliable for classroom group photos.
+        We first score every candidate at the same normalized face size, then look
+        for a meaningful focus gap. This keeps genuinely focused small students
+        while removing a cluster of visibly softer/background faces.
         """
-        kept = []
         h, w = rgb_image.shape[:2]
+        scored = []
         for loc in locations:
             t, r, b, l = [int(v) for v in loc]
             t = max(0, t); l = max(0, l); b = min(h, b); r = min(w, r)
             if b <= t or r <= l:
                 continue
-            fw, fh = r - l, b - t
-            crop = rgb_image[t:b, l:r]
-            score = self._focus_score(crop)
-            if min(fw, fh) < 32:
-                threshold = MIN_FACE_SHARPNESS_SMALL
-            else:
-                threshold = MIN_FACE_SHARPNESS_LARGE
-            # Never reject a face solely for focus when it is tiny; tiny faces
-            # can have unstable focus metrics. They are retained if their box is
-            # sensible and the detector found them strongly enough.
-            if min(fw, fh) >= 24 and score < threshold:
+            score = self._focus_score(rgb_image[t:b, l:r])
+            scored.append(((t, r, b, l), score))
+
+        if not scored:
+            return []
+
+        scores = [score for _, score in scored]
+        best = max(scores)
+        ordered = sorted(range(len(scored)), key=lambda i: scored[i][1], reverse=True)
+
+        # Detect a real separation between sharp foreground faces and softer
+        # background faces. Do not split a nearly uniform set of faces.
+        cut = len(ordered)
+        best_gap = 1.0
+        for pos in range(1, len(ordered)):
+            upper = scored[ordered[pos - 1]][1]
+            lower = scored[ordered[pos]][1]
+            ratio = upper / max(lower, 1e-6)
+            if ratio > best_gap:
+                best_gap = ratio
+                cut = pos
+
+        kept = []
+        for rank, idx in enumerate(ordered):
+            loc, score = scored[idx]
+            t, r, b, l = loc
+            min_dim = min(r - l, b - t)
+            absolute_floor = MIN_FACE_SHARPNESS_SMALL if min_dim < 42 else MIN_FACE_SHARPNESS_LARGE
+            relative_floor = best * FOCUS_RELATIVE_MIN
+
+            # Apply the gap only when it is strong enough and leaves at least one
+            # candidate. Otherwise use the normalized absolute/relative floor.
+            use_gap_cut = (
+                best_gap >= FOCUS_GAP_RATIO
+                and 2 <= cut < len(ordered)
+                and (len(ordered) - cut) <= max(1, len(ordered) // 2)
+            )
+            if use_gap_cut and rank >= cut:
                 continue
-            kept.append((t, r, b, l))
+            if score < absolute_floor and score < relative_floor:
+                continue
+            kept.append(loc)
+
         return kept
 
     def _dedupe_face_locations(self, locations, image_shape):
@@ -983,13 +1030,15 @@ class ClassroomAttendanceSystem:
 
             strong_limit = min(float(tolerance), 0.58)
             relaxed_limit = max(float(tolerance), 0.62)
+            required_confidence = max(0.50, float(min_confidence))
 
             accepted = False
-            if best_distance <= strong_limit and confidence >= 0.40:
+            # Attendance policy: anything below 50% is always Unrecognized.
+            if best_distance <= strong_limit and confidence >= required_confidence:
                 accepted = True
             elif (
                 best_distance <= relaxed_limit
-                and confidence >= max(0.36, float(min_confidence))
+                and confidence >= required_confidence
                 and margin >= 0.075
             ):
                 accepted = True
