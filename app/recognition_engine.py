@@ -9,7 +9,7 @@ import json
 import urllib.request
 import threading
 
-MIN_CONFIDENCE = 0.50
+MIN_CONFIDENCE = 0.45
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
@@ -243,46 +243,26 @@ class ClassroomAttendanceSystem:
         YuNet is used instead of Haar Cascade because some Railway OpenCV builds do
         not expose CascadeClassifier. It is also substantially better for small,
         partially occluded and non-frontal faces.
-
-        The model is fetched over the network on first use, so a slow or
-        blocked connection to the model host can silently remove YuNet from
-        the detection pipeline. To keep detection reliable, this retries the
-        download a few times with a timeout instead of failing on the first
-        hiccup, and clearly logs success/failure so a drop in detected faces
-        can be diagnosed from the logs.
         """
         if not hasattr(cv2, "FaceDetectorYN"):
-            print("YuNet unavailable: this OpenCV build has no FaceDetectorYN.")
             return None
         os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True)
         if not os.path.exists(YUNET_MODEL_PATH):
             tmp = YUNET_MODEL_PATH + ".download"
-            with self._yunet_lock:
-                if not os.path.exists(YUNET_MODEL_PATH):
-                    last_exc = None
-                    for attempt in range(1, 4):
-                        try:
-                            print(f"Downloading YuNet face detector model (attempt {attempt}/3)...")
-                            with urllib.request.urlopen(YUNET_MODEL_URL, timeout=15) as resp, open(tmp, "wb") as out:
-                                out.write(resp.read())
-                            os.replace(tmp, YUNET_MODEL_PATH)
-                            print("YuNet model downloaded successfully.")
-                            last_exc = None
-                            break
-                        except Exception as exc:
-                            last_exc = exc
-                            try:
-                                if os.path.exists(tmp):
-                                    os.remove(tmp)
-                            except Exception:
-                                pass
-                    if last_exc is not None:
-                        print(
-                            f"YuNet model download failed after 3 attempts: {last_exc}. "
-                            "Detection will fall back to HOG-only passes, which typically "
-                            "misses more small/angled classroom faces."
-                        )
-                        return None
+            try:
+                with self._yunet_lock:
+                    if not os.path.exists(YUNET_MODEL_PATH):
+                        print("Downloading YuNet face detector model...")
+                        urllib.request.urlretrieve(YUNET_MODEL_URL, tmp)
+                        os.replace(tmp, YUNET_MODEL_PATH)
+            except Exception as exc:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                print(f"YuNet model download failed: {exc}")
+                return None
         try:
             detector = cv2.FaceDetectorYN.create(
                 YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
@@ -293,7 +273,14 @@ class ClassroomAttendanceSystem:
             print(f"YuNet initialization failed: {exc}")
             return None
 
-    def _yunet_locations(self, bgr_image):
+    def _yunet_detections(self, bgr_image):
+        """Return YuNet face boxes plus confidence/eye landmarks.
+
+        YuNet already supplies eye landmarks. We use those only as detector
+        evidence; we deliberately do not run face_recognition.face_landmarks()
+        over every candidate because that is unnecessarily expensive for
+        classroom images.
+        """
         h, w = bgr_image.shape[:2]
         detector = self._get_yunet_detector((w, h))
         if detector is None:
@@ -305,57 +292,35 @@ class ClassroomAttendanceSystem:
                 return []
             results = []
             for row in detections:
-                vals = [float(v) for v in row]
-                if len(vals) < 15:
-                    # Malformed row; fall back to bbox-only, no landmarks.
-                    x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
-                    score = vals[4] if len(vals) > 4 else 1.0
-                else:
-                    # OpenCV FaceDetectorYN row layout:
-                    # [x, y, w, h, re_x, re_y, le_x, le_y, nose_x, nose_y,
-                    #  rmc_x, rmc_y, lmc_x, lmc_y, score]
-                    # The confidence score is the LAST value, not index 4 —
-                    # index 4 is the right-eye x-coordinate. Reading it as a
-                    # score silently disabled this filter and, more
-                    # importantly, meant a poorly-fit box was never corrected.
-                    x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
-                    right_eye_x, right_eye_y = vals[4], vals[5]
-                    left_eye_x, left_eye_y = vals[6], vals[7]
-                    score = vals[14]
-
+                values = [float(v) for v in row]
+                if len(values) < 5:
+                    continue
+                x, y, bw, bh, score = values[:5]
                 if score < 0.35 or bw < 10 or bh < 10:
                     continue
-
-                if len(vals) >= 15:
-                    # YuNet's eye landmarks are reliable even when a mask hides
-                    # the lower half. Use them to repair badly anchored boxes.
-                    interocular = abs(left_eye_x - right_eye_x)
-                    if interocular > 2:
-                        eye_cx = (right_eye_x + left_eye_x) / 2.0
-                        eye_cy = (right_eye_y + left_eye_y) / 2.0
-                        eye_frac_y = (eye_cy - y) / max(1.0, bh)
-
-                        # The raw YuNet box can become too small/high on masked
-                        # faces. Eye spacing gives a much more stable face scale.
-                        plausible_w = interocular * 2.35
-                        face_w = max(plausible_w, bw * 0.85)
-                        face_w = min(face_w, max(plausible_w * 1.65, bw * 1.25))
-
-                        if (
-                            eye_frac_y < 0.25
-                            or eye_frac_y > 0.58
-                            or bw < interocular * 1.65
-                        ):
-                            face_h = max(face_w * 1.22, interocular * 2.85)
-                            x = eye_cx - face_w / 2.0
-                            y = eye_cy - face_h * 0.40
-                            bw, bh = face_w, face_h
-
-                results.append((int(y), int(x + bw), int(y + bh), int(x)))
+                eyes = []
+                if len(values) >= 9:
+                    for idx in (5, 7):
+                        ex = max(0.0, min(float(w - 1), values[idx]))
+                        ey = max(0.0, min(float(h - 1), values[idx + 1]))
+                        eyes.append((ex, ey))
+                results.append({
+                    "location": (
+                        max(0, int(round(y))),
+                        min(w, int(round(x + bw))),
+                        min(h, int(round(y + bh))),
+                        max(0, int(round(x))),
+                    ),
+                    "score": float(score),
+                    "eyes": eyes,
+                })
             return results
         except Exception as exc:
             print(f"YuNet detection failed: {exc}")
             return []
+
+    def _yunet_locations(self, bgr_image):
+        return [item["location"] for item in self._yunet_detections(bgr_image)]
 
 
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
@@ -613,114 +578,72 @@ class ClassroomAttendanceSystem:
         # because some production OpenCV builds omit CascadeClassifier.
         return []
 
-    @staticmethod
-    def _clamp_location(location, image_shape):
-        h, w = image_shape[:2]
-        top, right, bottom, left = [int(v) for v in location]
-        top = max(0, min(h - 1, top))
-        left = max(0, min(w - 1, left))
-        bottom = max(top + 1, min(h, bottom))
-        right = max(left + 1, min(w, right))
-        return (top, right, bottom, left)
+    def _face_focus_score(self, rgb_image, location):
+        """Cheap focus score for rejecting strongly blurred background faces."""
+        t, r, b, l = [int(v) for v in location]
+        h, w = rgb_image.shape[:2]
+        t, l = max(0, t), max(0, l)
+        b, r = min(h, b), min(w, r)
+        if b <= t or r <= l:
+            return 0.0
+        crop = rgb_image[t:b, l:r]
+        if crop.shape[0] < 18 or crop.shape[1] < 18:
+            return 0.0
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        y0, y1 = int(gray.shape[0] * 0.12), int(gray.shape[0] * 0.88)
+        x0, x1 = int(gray.shape[1] * 0.10), int(gray.shape[1] * 0.90)
+        core = gray[y0:y1, x0:x1]
+        if core.size == 0:
+            return 0.0
+        return float(cv2.Laplacian(core, cv2.CV_64F).var())
 
-    def _face_focus_and_geometry(self, rgb_image, location):
-        """Measure local sharpness and whether the box contains face geometry."""
-        try:
-            top, right, bottom, left = self._clamp_location(location, rgb_image.shape)
-            crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
-            h, w = crop.shape[:2]
-            if h < 24 or w < 20:
-                return 0.0, 0.0, False
-
-            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-            y1, y2 = int(h * 0.12), int(h * 0.90)
-            x1, x2 = int(w * 0.10), int(w * 0.90)
-            roi = gray[y1:max(y1 + 1, y2), x1:max(x1 + 1, x2)]
-            if roi.size == 0:
-                roi = gray
-
-            focus = float(cv2.Laplacian(roi, cv2.CV_64F).var())
-
-            landmark_crop = crop
-            if max(h, w) < 180:
-                scale = min(4.0, 180.0 / max(h, w))
-                landmark_crop = cv2.resize(
-                    crop, None, fx=scale, fy=scale,
-                    interpolation=cv2.INTER_CUBIC
-                )
-
-            try:
-                landmarks = face_recognition.face_landmarks(
-                    landmark_crop, model="large"
-                )
-            except Exception:
-                landmarks = []
-
-            if not landmarks:
-                return focus, 0.0, False
-
-            lm = landmarks[0]
-            eyes = bool(lm.get("left_eye")) and bool(lm.get("right_eye"))
-            nose = bool(lm.get("nose_bridge")) or bool(lm.get("nose_tip"))
-            mouth = bool(lm.get("top_lip")) or bool(lm.get("bottom_lip"))
-
-            if eyes:
-                geometry = 1.0
-            elif nose and (mouth or bool(lm.get("left_eye")) or bool(lm.get("right_eye"))):
-                geometry = 0.75
-            else:
-                geometry = 0.25
-
-            return focus, geometry, eyes
-        except Exception:
-            return 0.0, 0.0, False
-
-    def _filter_face_locations(self, rgb_image, locations):
-        """Reject neck/background false positives and severely blurred faces."""
-        if not locations:
-            return []
-
-        scored = []
+    def _refine_with_yunet(self, locations, yunet_detections, rgb_image):
+        """Prefer YuNet's complete box, especially for masked faces."""
+        if not yunet_detections:
+            return locations
+        refined = []
         for loc in locations:
-            loc = self._clamp_location(loc, rgb_image.shape)
-            top, right, bottom, left = loc
-            area = max(1, (right - left) * (bottom - top))
-            focus, geometry, has_eyes = self._face_focus_and_geometry(
-                rgb_image, loc
-            )
-            scored.append((loc, focus, geometry, has_eyes, area))
+            best = None
+            best_iou = 0.0
+            for det in yunet_detections:
+                iou = self._box_iou(loc, det["location"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best = det
+            if best is not None and best_iou >= 0.20 and best["score"] >= 0.45:
+                loc = best["location"]
+            refined.append(loc)
+        # Strong YuNet detections missed by HOG/tile passes are valid recovery
+        # candidates, including small or masked students.
+        for det in yunet_detections:
+            loc = det["location"]
+            if det["score"] >= 0.50 and not any(self._box_iou(loc, x) >= 0.20 for x in refined):
+                refined.append(loc)
+        return self._dedupe_face_locations(refined, rgb_image.shape)
 
-        best_focus = max((x[1] for x in scored), default=0.0)
+    def _filter_weak_face_candidates(self, locations, rgb_image, yunet_detections):
+        """Remove obvious non-face/defocused candidates with cheap checks."""
         kept = []
-
-        for loc, focus, geometry, has_eyes, area in scored:
-            top, right, bottom, left = loc
-            bw, bh = right - left, bottom - top
+        for loc in locations:
+            t, r, b, l = loc
+            bw, bh = r - l, b - t
+            if bw < 18 or bh < 18:
+                continue
             ratio = bw / float(max(1, bh))
-            tiny = min(bw, bh) < 42
-
-            # A neck/clothing false positive normally has no pair of eyes.
-            # Keep only tiny, sharp, compact candidates as an exception.
-            if geometry < 0.70:
-                if not (
-                    tiny
-                    and focus >= max(18.0, best_focus * 0.18)
-                    and 0.48 <= ratio <= 1.65
-                ):
-                    continue
-
-            relative_focus = focus / max(best_focus, 1.0)
-            # Strong eye geometry permits smaller/distant faces; weak geometry
-            # must be reasonably sharp to survive.
-            if geometry < 1.0 and relative_focus < 0.16:
+            if ratio < 0.45 or ratio > 1.65:
                 continue
-            if geometry >= 1.0 and relative_focus < 0.07:
+            yu_support = max((self._box_iou(loc, d["location"]) for d in yunet_detections), default=0.0)
+            # Small detections need detector confirmation; this protects the
+            # fourth/distant student while suppressing many tiny background
+            # HOG false positives.
+            if min(bw, bh) < 42 and yu_support < 0.20:
                 continue
-
+            focus = self._face_focus_score(rgb_image, loc)
+            min_focus = 5.0 if min(bw, bh) < 35 else (10.0 if min(bw, bh) < 60 else 16.0)
+            if focus < min_focus and yu_support < 0.35:
+                continue
             kept.append(loc)
-
-        kept.sort(key=lambda x: (x[0], x[3]))
-        return kept
+        return self._dedupe_face_locations(kept, rgb_image.shape)
 
     def _detect_face_locations(self, rgb_image):
         """Detect faces independently of recognition, including difficult group-photo faces.
@@ -739,6 +662,7 @@ class ClassroomAttendanceSystem:
         detect_img, scale = self._downscale_rgb(original, MAX_DETECT_EDGE)
         inv_scale = 1.0 / scale
         raw = []
+        yunet_detections = []
 
         def restore(loc):
             t, r, b, l = loc
@@ -750,24 +674,27 @@ class ClassroomAttendanceSystem:
             )
 
         # 1) Primary frontal HOG.
-        pass1_count = 0
         try:
             for loc in face_recognition.face_locations(
                 detect_img, number_of_times_to_upsample=1, model="hog"
             ):
                 raw.append(restore(loc))
-                pass1_count += 1
         except Exception as exc:
             print(f"Primary HOG detection failed: {exc}")
 
         # 2) YuNet is the primary recovery detector. It handles small,
         # partially occluded, profile and masked faces much better than Haar.
-        pass2_count = 0
         try:
             yunet_input = cv2.cvtColor(detect_img, cv2.COLOR_RGB2BGR)
-            for loc in self._yunet_locations(yunet_input):
-                raw.append(restore(loc))
-                pass2_count += 1
+            for det in self._yunet_detections(yunet_input):
+                t, r, b, l = det["location"]
+                restored = restore((t, r, b, l))
+                raw.append(restored)
+                yunet_detections.append({
+                    "location": restored,
+                    "score": det["score"],
+                    "eyes": det.get("eyes", []),
+                })
             del yunet_input
         except Exception as exc:
             print(f"YuNet recovery failed: {exc}")
@@ -777,7 +704,6 @@ class ClassroomAttendanceSystem:
         # miss those, while a sequential overlapping tile gives the detector
         # much more face resolution without the memory cost of full-image
         # upsample=2/3.
-        pass3_count = 0
         th, tw = detect_img.shape[:2]
         tile_w = max(420, int(tw * 0.62))
         tile_h = max(360, int(th * 0.62))
@@ -797,14 +723,12 @@ class ClassroomAttendanceSystem:
                     ):
                         t, r, b, l = loc
                         raw.append(restore((t+y0, r+x0, b+y0, l+x0)))
-                        pass3_count += 1
                 except Exception as exc:
                     print(f"HOG tile detection failed at ({x0},{y0}): {exc}")
                 del tile
                 gc.collect()
 
         # 4) Orientation recovery.
-        pass4_count = 0
         for rotation, rotated in (
             ("cw", cv2.rotate(detect_img, cv2.ROTATE_90_CLOCKWISE)),
             ("ccw", cv2.rotate(detect_img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
@@ -815,7 +739,6 @@ class ClassroomAttendanceSystem:
                 ):
                     mapped = self._map_rotated_location(loc, detect_img.shape, rotation)
                     raw.append(restore(mapped))
-                    pass4_count += 1
             except Exception as exc:
                 print(f"Rotated HOG ({rotation}) failed: {exc}")
             del rotated
@@ -823,35 +746,31 @@ class ClassroomAttendanceSystem:
 
         # 5) A second YuNet pass on a 1.35x image catches distant/partially
         # occluded faces that are below the effective size of the first pass.
-        pass5_count = 0
         try:
             enlarged = cv2.resize(detect_img, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
-            for loc in self._yunet_locations(cv2.cvtColor(enlarged, cv2.COLOR_RGB2BGR)):
-                t,r,b,l = loc
-                raw.append(restore((int(t/1.35), int(r/1.35), int(b/1.35), int(l/1.35))))
-                pass5_count += 1
+            enlarged_detections = self._yunet_detections(cv2.cvtColor(enlarged, cv2.COLOR_RGB2BGR))
+            for det in enlarged_detections:
+                t, r, b, l = det["location"]
+                restored = restore((int(t/1.35), int(r/1.35), int(b/1.35), int(l/1.35)))
+                raw.append(restored)
+                yunet_detections.append({
+                    "location": restored,
+                    "score": det["score"],
+                    "eyes": det.get("eyes", []),
+                })
             del enlarged
             gc.collect()
         except Exception as exc:
             print(f"Enlarged YuNet recovery failed: {exc}")
 
         final_locations = self._dedupe_face_locations(raw, original.shape)
-        before_quality = len(final_locations)
-        final_locations = self._filter_face_locations(original, final_locations)
-        print(
-            f"Detection pass breakdown -> primary_hog={pass1_count}, "
-            f"yunet_pass1={pass2_count}, tile_hog={pass3_count}, "
-            f"rotated_hog={pass4_count}, yunet_pass2={pass5_count}, "
-            f"raw_total={len(raw)}, after_dedupe={before_quality}, "
-            f"after_quality={len(final_locations)}"
+        final_locations = self._refine_with_yunet(
+            final_locations, yunet_detections, original
         )
-        if pass2_count == 0 and pass5_count == 0:
-            print(
-                "WARNING: both YuNet passes returned 0 faces this run. If this "
-                "is unexpected, check the earlier 'YuNet' log lines above for a "
-                "download/initialization failure — YuNet is usually the biggest "
-                "contributor of small/angled faces in group photos."
-            )
+        final_locations = self._filter_weak_face_candidates(
+            final_locations, original, yunet_detections
+        )
+        print(f"Detected {len(final_locations)} face(s) in image.")
         return final_locations
 
     def _assign_faces_to_students(
@@ -861,19 +780,20 @@ class ClassroomAttendanceSystem:
         allowed_set: set | None,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> dict[int, tuple[int | None, str, float]]:
-        """Assign every detected face to an enrolled student without duplicates.
+        """Assign clear detected faces to enrolled students without duplicates.
 
-        Recognition is intentionally independent from Stage-1 detection, and
-        every detected face (including ones whose lower face is partly
-        covered) is checked here — none are pre-filtered out before this
-        step. Assignment is global and one-to-one so the same student cannot
-        be marked present for multiple detected faces.
+        Recognition is intentionally independent from Stage-1 detection.  This
+        matcher is tuned for classroom photos where an enrolled student's face
+        can be farther from the profile-photo embedding because of distance,
+        pose, lighting, or expression.  We therefore use a two-tier acceptance
+        rule instead of a single overly-strict threshold:
 
-        Acceptance rule (simple and explicit): a face's match confidence is
-        ``1 - distance`` against its closest enrolled student. If that
-        confidence is 50% or higher, the face is recognised as that student.
-        If it is below 50%, the face is left unmatched and is reported as
-        unrecognized rather than being forced into an identity.
+        * strong matches are accepted directly;
+        * weaker matches are accepted only when they have a clear margin over
+          the next-best student for that face.
+
+        Assignment is global and one-to-one so the same student cannot be marked
+        present for multiple detected faces.
         """
         if not face_encodings_by_index or not self.known_face_encodings:
             return {i: (None, "Unknown", 0.0) for i in face_encodings_by_index}
@@ -915,8 +835,9 @@ class ClassroomAttendanceSystem:
             options.sort(key=lambda item: item[0])
             candidates_by_face[face_index] = options
 
-        # Convert each face's candidate list into an acceptance candidate
-        # using the 50%-confidence rule described above.
+        # Convert each face's candidate list into an acceptance candidate.  A
+        # relaxed match is allowed for difficult classroom faces only when the
+        # best student is clearly separated from the second-best student.
         candidates = []
         for face_index, options in candidates_by_face.items():
             if not options:
@@ -924,11 +845,23 @@ class ClassroomAttendanceSystem:
 
             best = options[0]
             best_distance, sid, name, confidence = best
+            second_distance = options[1][0] if len(options) > 1 else float("inf")
+            margin = second_distance - best_distance
 
-            # Percentage-based acceptance: confidence is 1 - distance,
-            # expressed as a percentage. >= 50% => recognised, < 50% => left
-            # unmatched (unrecognized).
-            if confidence >= float(min_confidence):
+            strong_limit = min(float(tolerance), 0.58)
+            relaxed_limit = max(float(tolerance), 0.62)
+
+            accepted = False
+            if best_distance <= strong_limit and confidence >= 0.40:
+                accepted = True
+            elif (
+                best_distance <= relaxed_limit
+                and confidence >= max(0.36, float(min_confidence))
+                and margin >= 0.075
+            ):
+                accepted = True
+
+            if accepted:
                 candidates.append(
                     (best_distance, face_index, sid, name, confidence)
                 )
