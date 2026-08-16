@@ -205,7 +205,7 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
-    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=98, padded=False):
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=78, padded=False, max_edge=384):
         """Return a high-quality face crop without introducing avoidable JPEG pixelation.
 
         The crop is always taken from the original full-resolution attendance image.
@@ -230,8 +230,8 @@ class ClassroomAttendanceSystem:
             crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
             crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
             longest = max(crop_bgr.shape[:2])
-            if longest > 1024:
-                scale = 1024.0 / longest
+            if longest > max_edge:
+                scale = float(max_edge) / longest
                 crop_bgr = cv2.resize(
                     crop_bgr,
                     (max(1, int(round(crop_bgr.shape[1] * scale))), max(1, int(round(crop_bgr.shape[0] * scale)))),
@@ -242,7 +242,7 @@ class ClassroomAttendanceSystem:
             # creating the harsh halos that made earlier crops look artificial.
             blurred = cv2.GaussianBlur(crop_bgr, (0, 0), 0.7)
             crop_bgr = cv2.addWeighted(crop_bgr, 1.08, blurred, -0.08, 0)
-            return self._encode_bgr_jpeg_base64(crop_bgr, quality=98, max_edge=1024)
+            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality, max_edge=max_edge)
         except Exception:
             return None
 
@@ -596,45 +596,65 @@ class ClassroomAttendanceSystem:
 
     @staticmethod
     def _focus_score(rgb_crop):
-        """Scale-normalized face focus score.
+        """Return a scale/contrast-normalized facial-detail score.
 
-        The old Laplacian test was strongly biased by face size: a small blurred
-        background face could still pass simply because it contained hair/clothes
-        edges, while a small but focused student could score too low. Every face
-        is resized to the same analysis size and the score combines high-frequency
-        energy with edge density.
+        This intentionally avoids ranking all faces against one another. In a
+        classroom photo, a focused small face can legitimately have a lower raw
+        Laplacian variance than a larger blurred face. We therefore measure
+        fine detail relative to local contrast and edge structure.
         """
         if rgb_crop is None or rgb_crop.size == 0:
             return 0.0
         try:
             h, w = rgb_crop.shape[:2]
-            if h < 12 or w < 12:
+            if min(h, w) < 12:
                 return 0.0
-            y0, y1 = int(h * 0.12), int(h * 0.88)
-            x0, x1 = int(w * 0.10), int(w * 0.90)
+
+            # The upper/central face area contains eyes and facial detail and is
+            # much less contaminated by shirts, shoulders and background edges.
+            y0, y1 = int(h * 0.08), int(h * 0.82)
+            x0, x1 = int(w * 0.12), int(w * 0.88)
             crop = rgb_crop[y0:y1, x0:x1]
             if crop.size == 0:
                 return 0.0
+
             gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-            gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
-            gray = cv2.GaussianBlur(gray, (3, 3), 0)
-            lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-            grad = float(np.mean(np.sqrt(gx * gx + gy * gy)))
-            edges = cv2.Canny(gray, 60, 140)
+            gray = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_CUBIC)
+            gray_f = gray.astype(np.float32)
+
+            # Blur removes high-frequency facial detail.  Measuring the detail
+            # left after a tiny Gaussian blur is substantially less sensitive to
+            # face size than raw Laplacian variance.
+            smooth = cv2.GaussianBlur(gray_f, (5, 5), 0)
+            detail = float(np.std(gray_f - smooth))
+            contrast = float(np.std(gray_f)) + 1.0
+            detail_ratio = detail / contrast
+
+            gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
+            gradient = float(np.mean(np.sqrt(gx * gx + gy * gy)))
+            gradient_norm = gradient / (contrast + 1.0)
+
+            edges = cv2.Canny(gray, 50, 120)
             edge_density = float(np.mean(edges > 0))
-            return 0.65 * lap + 0.25 * grad + 0.10 * (edge_density * 100.0)
+
+            # Dimensionless score. Higher = more facial detail/focus.
+            return (
+                0.55 * detail_ratio
+                + 0.30 * min(1.0, gradient_norm / 2.5)
+                + 0.15 * min(1.0, edge_density / 0.10)
+            )
         except Exception:
             return 0.0
 
     def _filter_face_locations_by_focus(self, rgb_image, locations):
-        """Filter background/blurred faces using normalized and relative focus.
+        """Remove only *clearly* out-of-focus faces.
 
-        A fixed blur threshold alone is unreliable for classroom group photos.
-        We first score every candidate at the same normalized face size, then look
-        for a meaningful focus gap. This keeps genuinely focused small students
-        while removing a cluster of visibly softer/background faces.
+        The previous relative-gap algorithm always tried to split a group into
+        "sharp" and "soft" faces. That was wrong for this application because
+        the fourth, genuinely focused student could be the lower-scoring face.
+        This version uses a conservative absolute blur gate and requires more
+        than one weak-detail signal before discarding a face.
         """
         h, w = rgb_image.shape[:2]
         scored = []
@@ -643,49 +663,41 @@ class ClassroomAttendanceSystem:
             t = max(0, t); l = max(0, l); b = min(h, b); r = min(w, r)
             if b <= t or r <= l:
                 continue
-            score = self._focus_score(rgb_image[t:b, l:r])
-            scored.append(((t, r, b, l), score))
+            crop = rgb_image[t:b, l:r]
+            score = self._focus_score(crop)
+            scored.append(((t, r, b, l), score, min(r - l, b - t)))
 
         if not scored:
             return []
 
-        scores = [score for _, score in scored]
-        best = max(scores)
-        ordered = sorted(range(len(scored)), key=lambda i: scored[i][1], reverse=True)
-
-        # Detect a real separation between sharp foreground faces and softer
-        # background faces. Do not split a nearly uniform set of faces.
-        cut = len(ordered)
-        best_gap = 1.0
-        for pos in range(1, len(ordered)):
-            upper = scored[ordered[pos - 1]][1]
-            lower = scored[ordered[pos]][1]
-            ratio = upper / max(lower, 1e-6)
-            if ratio > best_gap:
-                best_gap = ratio
-                cut = pos
-
         kept = []
-        for rank, idx in enumerate(ordered):
-            loc, score = scored[idx]
-            t, r, b, l = loc
-            min_dim = min(r - l, b - t)
-            absolute_floor = MIN_FACE_SHARPNESS_SMALL if min_dim < 42 else MIN_FACE_SHARPNESS_LARGE
-            relative_floor = best * FOCUS_RELATIVE_MIN
+        filtered = []
+        for loc, score, min_dim in scored:
+            # Do not filter tiny faces solely on focus. At that size there is
+            # not enough pixel information for a reliable blur decision.
+            if min_dim < 32:
+                kept.append(loc)
+                continue
 
-            # Apply the gap only when it is strong enough and leaves at least one
-            # candidate. Otherwise use the normalized absolute/relative floor.
-            use_gap_cut = (
-                best_gap >= FOCUS_GAP_RATIO
-                and 2 <= cut < len(ordered)
-                and (len(ordered) - cut) <= max(1, len(ordered) // 2)
+            # Strict enough that ordinary JPEG/compression softness survives,
+            # but a deliberately blurred/background face is rejected.
+            detail_floor = 0.055 if min_dim >= 55 else 0.045
+            if score < detail_floor:
+                filtered.append((loc, score, min_dim))
+            else:
+                kept.append(loc)
+
+        print(
+            "Focus scores -> "
+            + ", ".join(
+                f"{score:.3f}@{dim}px" for _, score, dim in scored
             )
-            if use_gap_cut and rank >= cut:
-                continue
-            if score < absolute_floor and score < relative_floor:
-                continue
-            kept.append(loc)
-
+        )
+        if filtered:
+            print(
+                "Focus filtered -> "
+                + ", ".join(f"{score:.3f}@{dim}px" for _, score, dim in filtered)
+            )
         return kept
 
     def _dedupe_face_locations(self, locations, image_shape):
