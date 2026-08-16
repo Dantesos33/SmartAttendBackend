@@ -12,6 +12,8 @@ import threading
 MIN_CONFIDENCE = 0.50
 MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
+SR_MODEL_URL = "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x2.pb"
+SR_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "FSRCNN_x2.pb")
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
 YUNET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
 
@@ -30,6 +32,8 @@ class ClassroomAttendanceSystem:
         self.sessions = self._load_json(self.sessions_path, [])
         self._yunet_detector = None
         self._yunet_lock = threading.Lock()
+        self._sr = None
+        self._sr_lock = threading.Lock()
         self.load_known_students_from_dir()
 
     def _load_json(self, path, default):
@@ -196,7 +200,50 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
-    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=98, padded=False):
+    def _get_superres(self):
+        """Load FSRCNN x2 once; download on first use and never affect attendance if unavailable."""
+        if not hasattr(cv2, "dnn_superres"):
+            return None
+        if self._sr is not None:
+            return self._sr
+        os.makedirs(os.path.dirname(SR_MODEL_PATH), exist_ok=True)
+        with self._sr_lock:
+            if self._sr is not None:
+                return self._sr
+            if not os.path.exists(SR_MODEL_PATH) or os.path.getsize(SR_MODEL_PATH) < 10000:
+                tmp = SR_MODEL_PATH + ".download"
+                for attempt in range(1, 4):
+                    try:
+                        print(f"Downloading FSRCNN x2 model (attempt {attempt}/3)...")
+                        with urllib.request.urlopen(SR_MODEL_URL, timeout=30) as resp, open(tmp, "wb") as out:
+                            while True:
+                                chunk = resp.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                out.write(chunk)
+                        if os.path.getsize(tmp) < 10000:
+                            raise RuntimeError("Downloaded FSRCNN model is unexpectedly small")
+                        os.replace(tmp, SR_MODEL_PATH)
+                        print("FSRCNN x2 model downloaded successfully.")
+                        break
+                    except Exception as exc:
+                        print(f"FSRCNN download failed: {exc}")
+                        try:
+                            if os.path.exists(tmp): os.remove(tmp)
+                        except Exception:
+                            pass
+            try:
+                sr = cv2.dnn_superres.DnnSuperResImpl_create()
+                sr.readModel(SR_MODEL_PATH)
+                sr.setModel("fsrcnn", 2)
+                self._sr = sr
+                print("FSRCNN x2 super-resolution loaded.")
+            except Exception as exc:
+                print(f"FSRCNN initialization failed; using interpolation fallback: {exc}")
+                self._sr = None
+        return self._sr
+
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=98, padded=False, max_edge=1024):
         """Return a high-quality face crop without introducing avoidable JPEG pixelation.
 
         The crop is always taken from the original full-resolution attendance image.
@@ -221,19 +268,29 @@ class ClassroomAttendanceSystem:
             crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
             crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
             longest = max(crop_bgr.shape[:2])
-            if longest > 1024:
-                scale = 1024.0 / longest
-                crop_bgr = cv2.resize(
-                    crop_bgr,
-                    (max(1, int(round(crop_bgr.shape[1] * scale))), max(1, int(round(crop_bgr.shape[0] * scale)))),
-                    interpolation=cv2.INTER_AREA,
-                )
-
-            # Very mild sharpening preserves edge detail after JPEG encoding without
-            # creating the harsh halos that made earlier crops look artificial.
-            blurred = cv2.GaussianBlur(crop_bgr, (0, 0), 0.7)
-            crop_bgr = cv2.addWeighted(crop_bgr, 1.08, blurred, -0.08, 0)
-            return self._encode_bgr_jpeg_base64(crop_bgr, quality=98, max_edge=1024)
+            # Neural upscale only when the source face is genuinely small.
+            # Large crops are not enlarged because that wastes memory and adds
+            # artificial detail. FSRCNN is presentation-only and never affects recognition.
+            if longest < 700:
+                sr = self._get_superres()
+                if sr is not None:
+                    try:
+                        crop_bgr = sr.upsample(crop_bgr)
+                    except Exception as exc:
+                        print(f"FSRCNN upscale failed; using interpolation fallback: {exc}")
+                        scale = min(2.0, 900.0 / max(1, longest))
+                        crop_bgr = cv2.resize(crop_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                else:
+                    scale = min(2.0, 900.0 / max(1, longest))
+                    if scale > 1.01:
+                        crop_bgr = cv2.resize(crop_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            if max(crop_bgr.shape[:2]) > max_edge:
+                scale = float(max_edge) / max(crop_bgr.shape[:2])
+                crop_bgr = cv2.resize(crop_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            # Mild unsharp mask after upscale, only to restore edge crispness.
+            blurred = cv2.GaussianBlur(crop_bgr, (0, 0), 0.65)
+            crop_bgr = cv2.addWeighted(crop_bgr, 1.06, blurred, -0.06, 0)
+            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality, max_edge=max_edge)
         except Exception:
             return None
 
@@ -727,12 +784,13 @@ class ClassroomAttendanceSystem:
         except Exception as exc:
             print(f"Enlarged YuNet recovery failed: {exc}")
 
-        final_locations = self._dedupe_face_locations(raw, original.shape)
+        deduped_locations = self._dedupe_face_locations(raw, original.shape)
+        final_locations = self._quality_filter_locations(original, deduped_locations)
         print(
             f"Detection pass breakdown -> primary_hog={pass1_count}, "
             f"yunet_pass1={pass2_count}, tile_hog={pass3_count}, "
             f"rotated_hog={pass4_count}, yunet_pass2={pass5_count}, "
-            f"raw_total={len(raw)}, after_dedupe={len(final_locations)}"
+            f"raw_total={len(raw)}, after_dedupe={len(deduped_locations)}, after_quality_filter={len(final_locations)}"
         )
         if pass2_count == 0 and pass5_count == 0:
             print(
@@ -742,6 +800,66 @@ class ClassroomAttendanceSystem:
                 "contributor of small/angled faces in group photos."
             )
         return final_locations
+
+    def _quality_filter_locations(self, rgb_image, locations):
+        """Conservative post-filter for objects, eye fragments, necks and soft background faces.
+
+        The detector itself is untouched. A candidate is removed only when there is
+        independent evidence that it is not a complete face or is strongly out of focus.
+        Small but sharp foreground faces are protected.
+        """
+        if not locations:
+            return []
+        h, w = rgb_image.shape[:2]
+        bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+        # YuNet confirmation boxes. This rejects isolated eyes/neck/object detections
+        # without changing the existing detector passes.
+        yu = self._yunet_locations(bgr)
+        kept = []
+        metrics = []
+        for loc in locations:
+            t,r,b,l = loc
+            fh, fw = b-t, r-l
+            if fh < 18 or fw < 18:
+                continue
+            overlap = max((self._box_iou(loc, y) for y in yu), default=0.0)
+            crop = rgb_image[max(0,t):min(h,b), max(0,l):min(w,r)]
+            if crop.size == 0:
+                continue
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+            # Ignore a thin border; neck/clothing boxes often have little face detail.
+            ih, iw = gray.shape[:2]
+            y1,y2 = int(ih*0.12), int(ih*0.88)
+            x1,x2 = int(iw*0.10), int(iw*0.90)
+            core = gray[y1:y2, x1:x2]
+            if core.size == 0: core = gray
+            lap = float(cv2.Laplacian(core, cv2.CV_64F).var())
+            gx = cv2.Sobel(core, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(core, cv2.CV_32F, 0, 1, ksize=3)
+            ten = float(np.mean(gx*gx + gy*gy))
+            # Normalize for face size so small faces are not automatically punished.
+            scale = max(1.0, min(fw, fh) / 80.0)
+            detail = (np.sqrt(max(0.0, lap)) + 0.18*np.sqrt(max(0.0, ten))) * scale
+            metrics.append((loc, overlap, detail, min(fw,fh)))
+        if not metrics:
+            return []
+        details = np.array([m[2] for m in metrics], dtype=np.float32)
+        median = float(np.median(details))
+        # Only use a relative blur cutoff when there are enough faces to establish
+        # a reliable focused foreground population.
+        for loc, overlap, detail, short_side in metrics:
+            # Independent YuNet confirmation is strong evidence of a real face.
+            # If there is no confirmation, require substantially stronger detail.
+            if overlap < 0.12 and detail < max(11.0, median*0.72):
+                continue
+            # Strongly blurred candidates are removed only when they are also smaller
+            # than the median face. This protects a small but focused student.
+            if len(metrics) >= 5 and short_side < float(np.median([m[3] for m in metrics])) * 0.88:
+                if detail < max(13.0, median*0.62):
+                    continue
+            kept.append(loc)
+        print(f"Face quality filter -> input={len(locations)}, kept={len(kept)}, filtered={len(locations)-len(kept)}, median_detail={median:.2f}")
+        return kept
 
     def _assign_faces_to_students(
         self,
