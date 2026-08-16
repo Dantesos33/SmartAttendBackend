@@ -14,8 +14,6 @@ MAX_DETECT_EDGE = 2000
 MAX_ANNOTATED_EDGE = 1200
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
 YUNET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
-FSRCNN_MODEL_URL = "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x2.pb"
-FSRCNN_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "FSRCNN_x2.pb")
 
 
 class ClassroomAttendanceSystem:
@@ -32,8 +30,6 @@ class ClassroomAttendanceSystem:
         self.sessions = self._load_json(self.sessions_path, [])
         self._yunet_detector = None
         self._yunet_lock = threading.Lock()
-        self._sr = None
-        self._sr_lock = threading.Lock()
         self.load_known_students_from_dir()
 
     def _load_json(self, path, default):
@@ -200,176 +196,46 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
-    def _get_fsrcnn(self):
-        """Load FSRCNN x2 lazily for display crops only. Never used for detection/recognition."""
-        if self._sr is not None:
-            return self._sr
-        if not hasattr(cv2, "dnn_superres"):
-            return None
-        os.makedirs(os.path.dirname(FSRCNN_MODEL_PATH), exist_ok=True)
-        with self._sr_lock:
-            if self._sr is not None:
-                return self._sr
-            if not os.path.exists(FSRCNN_MODEL_PATH) or os.path.getsize(FSRCNN_MODEL_PATH) < 20000:
-                tmp = FSRCNN_MODEL_PATH + ".download"
-                last_exc = None
-                for attempt in range(1, 4):
-                    try:
-                        print(f"Downloading FSRCNN x2 face crop upscaler (attempt {attempt}/3)...")
-                        with urllib.request.urlopen(FSRCNN_MODEL_URL, timeout=30) as resp, open(tmp, "wb") as out:
-                            out.write(resp.read())
-                        if os.path.getsize(tmp) < 20000:
-                            raise RuntimeError("Downloaded FSRCNN model is unexpectedly small")
-                        os.replace(tmp, FSRCNN_MODEL_PATH)
-                        last_exc = None
-                        print("FSRCNN x2 face crop upscaler downloaded successfully.")
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                        try:
-                            if os.path.exists(tmp):
-                                os.remove(tmp)
-                        except Exception:
-                            pass
-                if last_exc is not None:
-                    print(f"FSRCNN download failed: {last_exc}. Using interpolation fallback.")
-                    return None
-            try:
-                sr = cv2.dnn_superres.DnnSuperResImpl_create()
-                sr.readModel(FSRCNN_MODEL_PATH)
-                sr.setModel("fsrcnn", 2)
-                self._sr = sr
-                print("FSRCNN x2 face crop upscaler loaded.")
-                return sr
-            except Exception as exc:
-                print(f"FSRCNN initialization failed: {exc}. Using interpolation fallback.")
-                return None
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=98, padded=False):
+        """Return a high-quality face crop without introducing avoidable JPEG pixelation.
 
-    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=98, padded=False, max_edge=1024):
-        """Create a clean, high-resolution display crop. This function never feeds back into detection or recognition."""
+        The crop is always taken from the original full-resolution attendance image.
+        We never downscale a small face, because enlarging a tiny source cannot restore
+        detail and was making profile photos look blocky. Larger crops are capped at
+        1024px and receive only a very mild unsharp mask after resizing.
+        """
         try:
             h, w = rgb_image.shape[:2]
-            top, left, bottom, right = int(top), int(left), int(bottom), int(right)
+            top, left = int(top), int(left)
+            bottom, right = int(bottom), int(right)
             if padded:
-                fh, fw = max(1, bottom-top), max(1, right-left)
-                pad_y, pad_x = int(fh*0.45), int(fw*0.45)
+                fh, fw = max(1, bottom - top), max(1, right - left)
+                pad_y = int(fh * 0.45)
+                pad_x = int(fw * 0.45)
                 top -= pad_y; bottom += pad_y; left -= pad_x; right += pad_x
-            top, left = max(0, top), max(0, left)
-            bottom, right = min(h, bottom), min(w, right)
+            top = max(0, top); left = max(0, left)
+            bottom = min(h, bottom); right = min(w, right)
             if bottom <= top or right <= left:
                 return None
-            crop_bgr = cv2.cvtColor(np.ascontiguousarray(rgb_image[top:bottom, left:right]), cv2.COLOR_RGB2BGR)
+
+            crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
+            crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
             longest = max(crop_bgr.shape[:2])
+            if longest > 1024:
+                scale = 1024.0 / longest
+                crop_bgr = cv2.resize(
+                    crop_bgr,
+                    (max(1, int(round(crop_bgr.shape[1] * scale))), max(1, int(round(crop_bgr.shape[0] * scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
 
-            # Neural x2 only for small/medium crops where pixelation is visible.
-            # Recognition continues to use the original image/encoding path.
-            sr = self._get_fsrcnn() if longest < 700 else None
-            if sr is not None:
-                try:
-                    crop_bgr = sr.upsample(crop_bgr)
-                except Exception as exc:
-                    print(f"FSRCNN crop upscale failed: {exc}; using interpolation fallback.")
-                    target = max(1, min(1024, int(longest*2)))
-                    scale = target / float(longest)
-                    crop_bgr = cv2.resize(crop_bgr, (max(1,int(round(crop_bgr.shape[1]*scale))), max(1,int(round(crop_bgr.shape[0]*scale)))), interpolation=cv2.INTER_CUBIC)
-            elif longest < 700:
-                target = max(1, min(1024, int(longest*2)))
-                scale = target / float(longest)
-                crop_bgr = cv2.resize(crop_bgr, (max(1,int(round(crop_bgr.shape[1]*scale))), max(1,int(round(crop_bgr.shape[0]*scale)))), interpolation=cv2.INTER_LANCZOS4)
-
-            longest = max(crop_bgr.shape[:2])
-            if longest > max_edge:
-                scale = max_edge / float(longest)
-                crop_bgr = cv2.resize(crop_bgr, (max(1,int(round(crop_bgr.shape[1]*scale))), max(1,int(round(crop_bgr.shape[0]*scale)))), interpolation=cv2.INTER_AREA)
-
-            # Very light sharpening after SR; avoid halos/pixel ringing.
-            blurred = cv2.GaussianBlur(crop_bgr, (0,0), 0.65)
-            crop_bgr = cv2.addWeighted(crop_bgr, 1.04, blurred, -0.04, 0)
-            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality, max_edge=max_edge)
+            # Very mild sharpening preserves edge detail after JPEG encoding without
+            # creating the harsh halos that made earlier crops look artificial.
+            blurred = cv2.GaussianBlur(crop_bgr, (0, 0), 0.7)
+            crop_bgr = cv2.addWeighted(crop_bgr, 1.08, blurred, -0.08, 0)
+            return self._encode_bgr_jpeg_base64(crop_bgr, quality=98, max_edge=1024)
         except Exception:
             return None
-
-    @staticmethod
-    def _focus_detail(rgb_crop):
-        """Normalized focus/detail score used only for false-positive filtering."""
-        try:
-            h,w=rgb_crop.shape[:2]
-            if h < 16 or w < 16:
-                return 0.0, 0.0, 0.0
-            gray=cv2.cvtColor(rgb_crop, cv2.COLOR_RGB2GRAY)
-            gray=cv2.resize(gray,(96,96),interpolation=cv2.INTER_AREA)
-            lap=float(cv2.Laplacian(gray,cv2.CV_64F).var())
-            gx=cv2.Sobel(gray,cv2.CV_64F,1,0,ksize=3); gy=cv2.Sobel(gray,cv2.CV_64F,0,1,ksize=3)
-            ten=float(np.mean(gx*gx+gy*gy))
-            edges=float(np.mean(cv2.Canny(gray,50,130)>0))
-            # Log compression prevents large faces from dominating.
-            score=(np.log1p(lap)/5.5)*0.45+(np.log1p(ten)/8.0)*0.45+min(edges/0.18,1.0)*0.10
-            return float(score), lap, ten
-        except Exception:
-            return 0.0,0.0,0.0
-
-    def _yunet_confirms_crop(self, rgb_crop):
-        """Optional second opinion used only for suspicious false positives."""
-        try:
-            h,w=rgb_crop.shape[:2]
-            if min(h,w) < 24:
-                return False
-            scale=1.0
-            if max(h,w) < 160:
-                scale=min(3.0,160.0/max(h,w))
-            bgr=cv2.cvtColor(rgb_crop,cv2.COLOR_RGB2BGR)
-            if scale != 1.0:
-                bgr=cv2.resize(bgr,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
-            locs=self._yunet_locations(bgr)
-            if not locs:
-                return False
-            # Any reasonable YuNet box centered in this candidate counts as support.
-            cx,cy=w/2.0,h/2.0
-            for t,r,b,l in locs:
-                bx=(l+r)/(2.0*scale); by=(t+b)/(2.0*scale)
-                bw=max(1,(r-l)/scale); bh=max(1,(b-t)/scale)
-                if abs(bx-cx) <= w*0.32 and abs(by-cy) <= h*0.35 and bw >= w*0.28 and bh >= h*0.28:
-                    return True
-            return False
-        except Exception:
-            return False
-
-    def _filter_false_positive_locations(self, rgb_image, locations):
-        """Post-detection filter. Existing detector passes and recognition are untouched."""
-        if not locations:
-            return locations
-        h,w=rgb_image.shape[:2]
-        records=[]
-        for i,(t,r,b,l) in enumerate(locations):
-            t=max(0,int(t)); l=max(0,int(l)); b=min(h,int(b)); r=min(w,int(r))
-            if b<=t or r<=l:
-                continue
-            crop=rgb_image[t:b,l:r]
-            score,lap,ten=self._focus_detail(crop)
-            area=(b-t)*(r-l)
-            records.append({"loc":(t,r,b,l),"score":score,"lap":lap,"ten":ten,"area":area,"w":r-l,"h":b-t})
-        if not records:
-            return []
-        scores=np.array([x["score"] for x in records],dtype=float)
-        areas=np.array([x["area"] for x in records],dtype=float)
-        median_score=float(np.median(scores)); median_area=float(np.median(areas))
-        kept=[]; rejected=0
-        for rec in records:
-            tiny=rec["area"] < median_area*0.72
-            very_soft=rec["score"] < max(0.28, median_score*0.48)
-            extremely_soft=rec["score"] < 0.22
-            # Never reject a candidate solely because it is small.
-            suspicious=(very_soft and tiny) or extremely_soft
-            if suspicious:
-                # A genuine small/partial face gets a chance to prove itself to YuNet.
-                confirmed=self._yunet_confirms_crop(rgb_image[rec["loc"][0]:rec["loc"][2],rec["loc"][3]:rec["loc"][1]])
-                if confirmed and not extremely_soft:
-                    kept.append(rec["loc"]); continue
-                rejected += 1
-                continue
-            kept.append(rec["loc"])
-        print(f"Post-detection quality filter -> input={len(records)}, kept={len(kept)}, filtered={rejected}, median_detail={median_score:.3f}")
-        return kept
 
     def _get_yunet_detector(self, input_size):
         """Return a lightweight YuNet detector. The model is downloaded once if absent.
@@ -862,7 +728,6 @@ class ClassroomAttendanceSystem:
             print(f"Enlarged YuNet recovery failed: {exc}")
 
         final_locations = self._dedupe_face_locations(raw, original.shape)
-        final_locations = self._filter_false_positive_locations(original, final_locations)
         print(
             f"Detection pass breakdown -> primary_hog={pass1_count}, "
             f"yunet_pass1={pass2_count}, tile_hog={pass3_count}, "
