@@ -15,6 +15,8 @@ MAX_ANNOTATED_EDGE = 1000
 MAX_FACE_CROP_EDGE = 512
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
 YUNET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
+SR_MODEL_URL = "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x2.pb"
+SR_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "FSRCNN_x2.pb")
 
 
 class ClassroomAttendanceSystem:
@@ -31,6 +33,8 @@ class ClassroomAttendanceSystem:
         self.sessions = self._load_json(self.sessions_path, [])
         self._yunet_detector = None
         self._yunet_lock = threading.Lock()
+        self._sr_model = None
+        self._sr_lock = threading.Lock()
         self.load_known_students_from_dir()
 
     def _load_json(self, path, default):
@@ -197,6 +201,99 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
+    def _get_superres(self):
+        """Load FSRCNN x2 once, downloading the model on first use if needed.
+
+        The model is treated like YuNet: it is stored in the container's local
+        models directory after a successful download. A temporary file and
+        atomic replace prevent a partial download from being loaded. If the
+        download or OpenCV super-resolution module is unavailable, callers
+        safely fall back to interpolation instead of failing attendance.
+        """
+        if self._sr_model is not None:
+            return self._sr_model
+
+        if not hasattr(cv2, "dnn_superres"):
+            print("OpenCV dnn_superres is unavailable; using high-quality interpolation fallback.")
+            return None
+
+        os.makedirs(os.path.dirname(SR_MODEL_PATH), exist_ok=True)
+
+        with self._sr_lock:
+            if self._sr_model is not None:
+                return self._sr_model
+
+            if not os.path.exists(SR_MODEL_PATH) or os.path.getsize(SR_MODEL_PATH) < 10000:
+                tmp = SR_MODEL_PATH + ".download"
+                last_exc = None
+                for attempt in range(1, 4):
+                    try:
+                        print(f"Downloading FSRCNN x2 face upscaler model (attempt {attempt}/3)...")
+                        request = urllib.request.Request(
+                            SR_MODEL_URL,
+                            headers={"User-Agent": "SmartAttend/1.0"},
+                        )
+                        with urllib.request.urlopen(request, timeout=30) as resp, open(tmp, "wb") as out:
+                            while True:
+                                chunk = resp.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                out.write(chunk)
+
+                        if os.path.getsize(tmp) < 10000:
+                            raise RuntimeError("Downloaded FSRCNN model is unexpectedly small.")
+
+                        os.replace(tmp, SR_MODEL_PATH)
+                        print("FSRCNN x2 face upscaler model downloaded successfully.")
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        try:
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
+                        except Exception:
+                            pass
+                        print(f"FSRCNN download attempt {attempt}/3 failed: {exc}")
+
+                if last_exc is not None and not os.path.exists(SR_MODEL_PATH):
+                    print(f"FSRCNN model download failed after 3 attempts: {last_exc}; using interpolation fallback.")
+                    return None
+
+            try:
+                sr = cv2.dnn_superres.DnnSuperResImpl_create()
+                sr.readModel(SR_MODEL_PATH)
+                sr.setModel("fsrcnn", 2)
+                sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                self._sr_model = sr
+                print("FSRCNN x2 face upscaler loaded.")
+            except Exception as exc:
+                print(f"FSRCNN initialization failed: {exc}; using interpolation fallback.")
+                self._sr_model = None
+
+        return self._sr_model
+
+    def _ai_upscale_face_crop(self, crop_bgr, target_edge=512):
+        """AI-upscale small face crops with FSRCNN x2 without changing detection/recognition."""
+        try:
+            longest = max(crop_bgr.shape[:2])
+            if longest >= min(384, target_edge):
+                return crop_bgr
+            sr = self._get_superres()
+            if sr is not None:
+                up = sr.upsample(crop_bgr)
+                if max(up.shape[:2]) > target_edge:
+                    scale = float(target_edge) / max(up.shape[:2])
+                    up = cv2.resize(up, (max(1, int(up.shape[1]*scale)), max(1, int(up.shape[0]*scale))), interpolation=cv2.INTER_AREA)
+                return np.ascontiguousarray(up)
+            # Safe fallback if the optional model is absent.
+            scale = min(2.0, float(target_edge) / max(1, longest))
+            return cv2.resize(crop_bgr, (max(1,int(crop_bgr.shape[1]*scale)), max(1,int(crop_bgr.shape[0]*scale))), interpolation=cv2.INTER_CUBIC)
+        except Exception as exc:
+            print(f"Face AI upscaling failed: {exc}")
+            return crop_bgr
+
     def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=82, padded=False, max_edge=MAX_FACE_CROP_EDGE):
         """Return a high-quality face crop without introducing avoidable JPEG pixelation.
 
@@ -221,6 +318,11 @@ class ClassroomAttendanceSystem:
 
             crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
             crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+            # Apply AI super-resolution only to genuinely small crops. This is
+            # presentation-only; detection and face recognition continue using
+            # the original image/encodings, so accuracy is not altered.
+            if max(crop_bgr.shape[:2]) < 384:
+                crop_bgr = self._ai_upscale_face_crop(crop_bgr, target_edge=max_edge)
             longest = max(crop_bgr.shape[:2])
             if longest > max_edge:
                 scale = float(max_edge) / longest
@@ -775,16 +877,26 @@ class ClassroomAttendanceSystem:
                 item["ten"] < max(22.0, median_ten * 0.34)
             )
             extremely_soft = (item["lap"] < 5.0 and item["ten"] < 14.0)
+            median_size = float(np.median([x["size"] for x in scored]))
             small_soft = (
-                item["size"] < max(70.0, float(np.median([x["size"] for x in scored])) * 0.82)
+                item["size"] < max(70.0, median_size * 0.82)
                 and item["lap"] < max(10.0, median_lap * 0.40)
                 and item["ten"] < max(25.0, median_ten * 0.48)
+            )
+            # Extra background-blur guard: a genuinely out-of-focus face in
+            # the back of a classroom is usually both smaller than the focused
+            # group and weak in BOTH independent detail measures. Require the
+            # combination, never size alone, so small focused students survive.
+            background_soft = (
+                item["size"] < max(64.0, median_size * 0.74)
+                and item["lap"] < max(12.0, median_lap * 0.50)
+                and item["ten"] < max(28.0, median_ten * 0.58)
             )
             # Neck/clothing/artifact candidates generally fail independent face
             # confirmation. This is separate from focus so a real but slightly
             # soft face is not removed just because YuNet prefers another box.
             no_face_support = not item["confirmed"] and not item["eye_support"]
-            reject = no_face_support or ((very_soft or small_soft) and not item["eye_support"]) or extremely_soft
+            reject = no_face_support or ((very_soft or small_soft or background_soft) and not item["eye_support"]) or extremely_soft
 
             # If YuNet is unavailable, _yunet_candidate_support deliberately
             # returns confirmed=True, so the quality stage degrades safely to
