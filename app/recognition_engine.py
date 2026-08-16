@@ -10,13 +10,10 @@ import urllib.request
 import threading
 
 MIN_CONFIDENCE = 0.50
-MAX_DETECT_EDGE = 1800
-MAX_ANNOTATED_EDGE = 1000
-MAX_FACE_CROP_EDGE = 512
+MAX_DETECT_EDGE = 2000
+MAX_ANNOTATED_EDGE = 1200
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
 YUNET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
-SR_MODEL_URL = "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x2.pb"
-SR_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "FSRCNN_x2.pb")
 
 
 class ClassroomAttendanceSystem:
@@ -33,8 +30,6 @@ class ClassroomAttendanceSystem:
         self.sessions = self._load_json(self.sessions_path, [])
         self._yunet_detector = None
         self._yunet_lock = threading.Lock()
-        self._sr_model = None
-        self._sr_lock = threading.Lock()
         self.load_known_students_from_dir()
 
     def _load_json(self, path, default):
@@ -201,100 +196,7 @@ class ClassroomAttendanceSystem:
         except Exception:
             return None
 
-    def _get_superres(self):
-        """Load FSRCNN x2 once, downloading the model on first use if needed.
-
-        The model is treated like YuNet: it is stored in the container's local
-        models directory after a successful download. A temporary file and
-        atomic replace prevent a partial download from being loaded. If the
-        download or OpenCV super-resolution module is unavailable, callers
-        safely fall back to interpolation instead of failing attendance.
-        """
-        if self._sr_model is not None:
-            return self._sr_model
-
-        if not hasattr(cv2, "dnn_superres"):
-            print("OpenCV dnn_superres is unavailable; using high-quality interpolation fallback.")
-            return None
-
-        os.makedirs(os.path.dirname(SR_MODEL_PATH), exist_ok=True)
-
-        with self._sr_lock:
-            if self._sr_model is not None:
-                return self._sr_model
-
-            if not os.path.exists(SR_MODEL_PATH) or os.path.getsize(SR_MODEL_PATH) < 10000:
-                tmp = SR_MODEL_PATH + ".download"
-                last_exc = None
-                for attempt in range(1, 4):
-                    try:
-                        print(f"Downloading FSRCNN x2 face upscaler model (attempt {attempt}/3)...")
-                        request = urllib.request.Request(
-                            SR_MODEL_URL,
-                            headers={"User-Agent": "SmartAttend/1.0"},
-                        )
-                        with urllib.request.urlopen(request, timeout=30) as resp, open(tmp, "wb") as out:
-                            while True:
-                                chunk = resp.read(1024 * 1024)
-                                if not chunk:
-                                    break
-                                out.write(chunk)
-
-                        if os.path.getsize(tmp) < 10000:
-                            raise RuntimeError("Downloaded FSRCNN model is unexpectedly small.")
-
-                        os.replace(tmp, SR_MODEL_PATH)
-                        print("FSRCNN x2 face upscaler model downloaded successfully.")
-                        last_exc = None
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                        try:
-                            if os.path.exists(tmp):
-                                os.remove(tmp)
-                        except Exception:
-                            pass
-                        print(f"FSRCNN download attempt {attempt}/3 failed: {exc}")
-
-                if last_exc is not None and not os.path.exists(SR_MODEL_PATH):
-                    print(f"FSRCNN model download failed after 3 attempts: {last_exc}; using interpolation fallback.")
-                    return None
-
-            try:
-                sr = cv2.dnn_superres.DnnSuperResImpl_create()
-                sr.readModel(SR_MODEL_PATH)
-                sr.setModel("fsrcnn", 2)
-                sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-                self._sr_model = sr
-                print("FSRCNN x2 face upscaler loaded.")
-            except Exception as exc:
-                print(f"FSRCNN initialization failed: {exc}; using interpolation fallback.")
-                self._sr_model = None
-
-        return self._sr_model
-
-    def _ai_upscale_face_crop(self, crop_bgr, target_edge=512):
-        """AI-upscale small face crops with FSRCNN x2 without changing detection/recognition."""
-        try:
-            longest = max(crop_bgr.shape[:2])
-            if longest >= min(384, target_edge):
-                return crop_bgr
-            sr = self._get_superres()
-            if sr is not None:
-                up = sr.upsample(crop_bgr)
-                if max(up.shape[:2]) > target_edge:
-                    scale = float(target_edge) / max(up.shape[:2])
-                    up = cv2.resize(up, (max(1, int(up.shape[1]*scale)), max(1, int(up.shape[0]*scale))), interpolation=cv2.INTER_AREA)
-                return np.ascontiguousarray(up)
-            # Safe fallback if the optional model is absent.
-            scale = min(2.0, float(target_edge) / max(1, longest))
-            return cv2.resize(crop_bgr, (max(1,int(crop_bgr.shape[1]*scale)), max(1,int(crop_bgr.shape[0]*scale))), interpolation=cv2.INTER_CUBIC)
-        except Exception as exc:
-            print(f"Face AI upscaling failed: {exc}")
-            return crop_bgr
-
-    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=82, padded=False, max_edge=MAX_FACE_CROP_EDGE):
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=98, padded=False):
         """Return a high-quality face crop without introducing avoidable JPEG pixelation.
 
         The crop is always taken from the original full-resolution attendance image.
@@ -318,14 +220,9 @@ class ClassroomAttendanceSystem:
 
             crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
             crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
-            # Apply AI super-resolution only to genuinely small crops. This is
-            # presentation-only; detection and face recognition continue using
-            # the original image/encodings, so accuracy is not altered.
-            if max(crop_bgr.shape[:2]) < 384:
-                crop_bgr = self._ai_upscale_face_crop(crop_bgr, target_edge=max_edge)
             longest = max(crop_bgr.shape[:2])
-            if longest > max_edge:
-                scale = float(max_edge) / longest
+            if longest > 1024:
+                scale = 1024.0 / longest
                 crop_bgr = cv2.resize(
                     crop_bgr,
                     (max(1, int(round(crop_bgr.shape[1] * scale))), max(1, int(round(crop_bgr.shape[0] * scale)))),
@@ -336,7 +233,7 @@ class ClassroomAttendanceSystem:
             # creating the harsh halos that made earlier crops look artificial.
             blurred = cv2.GaussianBlur(crop_bgr, (0, 0), 0.7)
             crop_bgr = cv2.addWeighted(crop_bgr, 1.08, blurred, -0.08, 0)
-            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality, max_edge=max_edge)
+            return self._encode_bgr_jpeg_base64(crop_bgr, quality=98, max_edge=1024)
         except Exception:
             return None
 
@@ -557,12 +454,6 @@ class ClassroomAttendanceSystem:
             if eyes and lower_edges < max(upper_edges * 0.82, 0.018):
                 score += 1
 
-            # YuNet eye support is particularly valuable when the lower face is
-            # completely covered and dlib landmarks cannot find a mouth/nose.
-            yunet_confirmed, yunet_eyes, _ = self._yunet_candidate_support(crop)
-            if yunet_eyes and not mouth:
-                score += 2
-
             # Require strong evidence.  This reduces false positives on sideways,
             # downward-facing and low-resolution clear faces.
             if score >= 3:
@@ -723,200 +614,6 @@ class ClassroomAttendanceSystem:
         # because some production OpenCV builds omit CascadeClassifier.
         return []
 
-    def _yunet_candidate_support(self, rgb_crop):
-        """Return whether YuNet independently supports a candidate face.
-
-        This is deliberately used as a *confirmation* pass after the existing
-        detector pipeline.  It does not replace HOG/tile detection, so small
-        faces that HOG finds are still available.  It mainly removes HOG
-        artifacts such as necks, eyes-only fragments and clothing regions.
-        """
-        try:
-            h, w = rgb_crop.shape[:2]
-            if h < 28 or w < 28:
-                return False, False, 0.0
-            # Upscale only this candidate.  Never upscale the whole classroom.
-            scale = 1.0
-            if max(h, w) < 180:
-                scale = min(3.0, 180.0 / max(h, w))
-                work = cv2.resize(rgb_crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            else:
-                work = rgb_crop
-            bgr = cv2.cvtColor(work, cv2.COLOR_RGB2BGR)
-            detector = self._get_yunet_detector((work.shape[1], work.shape[0]))
-            if detector is None:
-                return True, False, 0.0
-            detector.setInputSize((work.shape[1], work.shape[0]))
-            _, detections = detector.detect(bgr)
-            if detections is None:
-                return False, False, 0.0
-            best_iou = 0.0
-            best_score = 0.0
-            eye_supported = False
-            for row in detections:
-                vals = [float(v) for v in row]
-                if len(vals) < 5:
-                    continue
-                x, y, bw, bh = vals[:4]
-                score = vals[14] if len(vals) >= 15 else vals[4]
-                if score < 0.35:
-                    continue
-                # Candidate itself is the complete crop.
-                inter_w = max(0.0, min(w * scale, x + bw) - max(0.0, x))
-                inter_h = max(0.0, min(h * scale, y + bh) - max(0.0, y))
-                inter = inter_w * inter_h
-                det_area = max(1.0, bw * bh)
-                crop_area = max(1.0, (w * scale) * (h * scale))
-                iou = inter / max(1.0, det_area + crop_area - inter)
-                best_iou = max(best_iou, iou)
-                if score > best_score:
-                    best_score = score
-                if len(vals) >= 15:
-                    rex, rey, lex, ley = vals[4], vals[5], vals[6], vals[7]
-                    eye_dx = abs(lex - rex)
-                    eye_cx = (lex + rex) / 2.0
-                    eye_cy = (ley + rey) / 2.0
-                    if eye_dx >= max(2.0, bw * 0.08) and 0.12 * bh <= eye_cy - y <= 0.72 * bh:
-                        eye_supported = True
-            # A candidate is confirmed when YuNet has a reasonably overlapping
-            # face, or when its eye landmarks strongly support an eyes-visible
-            # face. The latter is important for masks/niqabs.
-            return (best_iou >= 0.12 or eye_supported), eye_supported, best_score
-        except Exception:
-            return True, False, 0.0
-
-    @staticmethod
-    def _focus_metrics(rgb_crop):
-        """Return size-normalized focus/detail metrics for one face crop."""
-        try:
-            h, w = rgb_crop.shape[:2]
-            if h < 18 or w < 18:
-                return 0.0, 0.0, 0.0
-            gray = cv2.cvtColor(rgb_crop, cv2.COLOR_RGB2GRAY)
-            # Normalize face size so a 45px face is not automatically judged
-            # softer than a 120px face simply because it contains fewer pixels.
-            gray = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
-            lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-            ten = float(np.mean(gx * gx + gy * gy))
-            edges = float(np.mean(cv2.Canny(gray, 50, 130) > 0))
-            return lap, ten, edges
-        except Exception:
-            return 0.0, 0.0, 0.0
-
-    def _filter_face_locations(self, rgb_image, locations):
-        """Conservative quality filter applied *after* the working detector.
-
-        The detector is the baseline and is intentionally left untouched. This
-        stage only removes candidates when there is independent evidence that
-        they are not a real, focused face. In particular, a neck/eye fragment
-        must normally fail the YuNet confirmation, while a genuine small face
-        is retained even when its absolute sharpness is lower.
-        """
-        if not locations:
-            return []
-        h, w = rgb_image.shape[:2]
-        scored = []
-        for idx, loc in enumerate(locations):
-            t, r, b, l = [int(v) for v in loc]
-            fh, fw = b - t, r - l
-            if fh < 14 or fw < 14:
-                continue
-            # Modest padding helps the focus metric and YuNet see the eye/face
-            # context without feeding the whole classroom image into anything.
-            py, px = int(fh * 0.22), int(fw * 0.22)
-            ct, cb = max(0, t - py), min(h, b + py)
-            cl, cr = max(0, l - px), min(w, r + px)
-            crop = np.ascontiguousarray(rgb_image[ct:cb, cl:cr])
-            lap, ten, edge = self._focus_metrics(crop)
-            confirmed, eye_support, yunet_score = self._yunet_candidate_support(crop)
-            scored.append({
-                "loc": loc,
-                "lap": lap,
-                "ten": ten,
-                "edge": edge,
-                "confirmed": confirmed,
-                "eye_support": eye_support,
-                "yunet": yunet_score,
-                "size": max(fh, fw),
-            })
-            del crop
-            if idx % 5 == 0:
-                gc.collect()
-
-        if not scored:
-            return []
-
-        # Do not use the weakest face as the baseline.  That was what caused
-        # focused students to disappear in the previous focus implementation.
-        # Instead, use robust medians and reject only faces that are both very
-        # soft in absolute terms and substantially below the group/detail level.
-        lap_values = np.array([x["lap"] for x in scored], dtype=np.float64)
-        ten_values = np.array([x["ten"] for x in scored], dtype=np.float64)
-        median_lap = float(np.median(lap_values))
-        median_ten = float(np.median(ten_values))
-
-        kept = []
-        filtered = 0
-        focus_log = []
-        for item in scored:
-            # Conservative blur rule. Small faces are protected by the relative
-            # factor and by the absolute floor; both focus metrics must be poor.
-            # Very conservative blur floor.  We require BOTH normalized focus
-            # measures to be extremely weak before rejecting a candidate, so a
-            # genuinely focused small student is protected.  A face with eye
-            # support is allowed through unless it is *extremely* soft.
-            # V5: tighten only the blur test. The detector itself is unchanged.
-            # Background faces that are genuinely out of focus tend to have both
-            # detail measures substantially below the focused-face population.
-            # We require BOTH measures to be weak, which protects faces that are
-            # small but still have real edge/detail information.
-            very_soft = (
-                item["lap"] < max(8.0, median_lap * 0.28) and
-                item["ten"] < max(22.0, median_ten * 0.34)
-            )
-            extremely_soft = (item["lap"] < 5.0 and item["ten"] < 14.0)
-            median_size = float(np.median([x["size"] for x in scored]))
-            small_soft = (
-                item["size"] < max(70.0, median_size * 0.82)
-                and item["lap"] < max(10.0, median_lap * 0.40)
-                and item["ten"] < max(25.0, median_ten * 0.48)
-            )
-            # Extra background-blur guard: a genuinely out-of-focus face in
-            # the back of a classroom is usually both smaller than the focused
-            # group and weak in BOTH independent detail measures. Require the
-            # combination, never size alone, so small focused students survive.
-            background_soft = (
-                item["size"] < max(64.0, median_size * 0.74)
-                and item["lap"] < max(12.0, median_lap * 0.50)
-                and item["ten"] < max(28.0, median_ten * 0.58)
-            )
-            # Neck/clothing/artifact candidates generally fail independent face
-            # confirmation. This is separate from focus so a real but slightly
-            # soft face is not removed just because YuNet prefers another box.
-            no_face_support = not item["confirmed"] and not item["eye_support"]
-            reject = no_face_support or ((very_soft or small_soft or background_soft) and not item["eye_support"]) or extremely_soft
-
-            # If YuNet is unavailable, _yunet_candidate_support deliberately
-            # returns confirmed=True, so the quality stage degrades safely to
-            # focus filtering rather than deleting all HOG detections.
-            if reject:
-                filtered += 1
-            else:
-                kept.append(item["loc"])
-            focus_log.append(
-                f"{item['size']}px:lap={item['lap']:.1f},ten={item['ten']:.1f},"
-                f"yunet={item['yunet']:.2f},eyes={int(item['eye_support'])},keep={not reject}"
-            )
-
-        print(
-            f"Focus/face quality -> input={len(locations)}, kept={len(kept)}, "
-            f"filtered={filtered}, median_lap={median_lap:.1f}, median_ten={median_ten:.1f}"
-        )
-        print("Focus candidates -> " + " | ".join(focus_log[:80]))
-        return kept
-
     def _detect_face_locations(self, rgb_image):
         """Detect faces independently of recognition, including difficult group-photo faces.
 
@@ -1031,14 +728,11 @@ class ClassroomAttendanceSystem:
             print(f"Enlarged YuNet recovery failed: {exc}")
 
         final_locations = self._dedupe_face_locations(raw, original.shape)
-        deduped_count = len(final_locations)
-        final_locations = self._filter_face_locations(original, final_locations)
         print(
             f"Detection pass breakdown -> primary_hog={pass1_count}, "
             f"yunet_pass1={pass2_count}, tile_hog={pass3_count}, "
             f"rotated_hog={pass4_count}, yunet_pass2={pass5_count}, "
-            f"raw_total={len(raw)}, after_dedupe={deduped_count}, "
-            f"after_quality_filter={len(final_locations)}"
+            f"raw_total={len(raw)}, after_dedupe={len(final_locations)}"
         )
         if pass2_count == 0 and pass5_count == 0:
             print(
@@ -1096,29 +790,15 @@ class ClassroomAttendanceSystem:
                 if allowed_set is not None and sid not in allowed_set:
                     continue
                 distance = float(raw_distance)
+                confidence = max(0.0, 1.0 - distance)
 
-                # Keep the same model and the same conservative distance ceiling,
-                # but calibrate the displayed familiarity score instead of using
-                # the raw `1 - distance` value. That raw formula is overly harsh:
-                # e.g. a distance of .56 is displayed as only 44%, even though
-                # it is inside the normal face-recognition match region.
-                #
-                # The calibrated score is monotonic: closer embeddings always
-                # receive a higher score. It is only a presentation/acceptance
-                # calibration; no model weights are changed.
+                # Hard ceiling.  Never allow a genuinely distant embedding to
+                # become a classroom match merely because the student is still
+                # unused.
                 if distance > max(float(tolerance), 0.64):
                     continue
-                if distance <= 0.50:
-                    familiarity = 0.92 + (0.50 - distance) * 0.40
-                elif distance <= 0.58:
-                    familiarity = 0.78 + (0.58 - distance) * 1.75
-                elif distance <= 0.64:
-                    familiarity = 0.50 + (0.64 - distance) * 4.67
-                else:
-                    familiarity = 0.0
-                familiarity = float(max(0.0, min(0.99, familiarity)))
                 options.append(
-                    (distance, sid, self.known_face_names[idx], familiarity)
+                    (distance, sid, self.known_face_names[idx], confidence)
                 )
 
             options.sort(key=lambda item: item[0])
@@ -1134,16 +814,10 @@ class ClassroomAttendanceSystem:
             best = options[0]
             best_distance, sid, name, confidence = best
 
-            # Require a clear enough lead over the next enrolled identity when
-            # there is a real second candidate. This improves low-confidence
-            # matches without lowering the 50% floor or changing the model.
-            # If the nearest two identities are nearly tied, the system should
-            # remain cautious rather than inventing an identity.
-            second_distance = options[1][0] if len(options) > 1 else None
-            margin = (second_distance - best_distance) if second_distance is not None else 1.0
-            ambiguous = second_distance is not None and margin < 0.035 and best_distance > 0.56
-
-            if confidence >= float(min_confidence) and not ambiguous:
+            # Percentage-based acceptance: confidence is 1 - distance,
+            # expressed as a percentage. >= 50% => recognised, < 50% => left
+            # unmatched (unrecognized).
+            if confidence >= float(min_confidence):
                 candidates.append(
                     (best_distance, face_index, sid, name, confidence)
                 )
@@ -1166,37 +840,6 @@ class ClassroomAttendanceSystem:
         for face_index in face_encodings_by_index:
             assignments.setdefault(face_index, (None, "Unknown", 0.0))
         return assignments
-
-    def _encode_face_one_at_a_time(self, rgb_image, location):
-        """Encode one face using a small crop to keep Railway memory bounded."""
-        try:
-            h, w = rgb_image.shape[:2]
-            top, right, bottom, left = [int(v) for v in location]
-            fh = max(1, bottom - top)
-            fw = max(1, right - left)
-            pad_y = int(fh * 0.35)
-            pad_x = int(fw * 0.35)
-            t = max(0, top - pad_y)
-            b = min(h, bottom + pad_y)
-            l = max(0, left - pad_x)
-            r = min(w, right + pad_x)
-            crop = np.ascontiguousarray(rgb_image[t:b, l:r])
-            if crop.size == 0:
-                return None
-            crop, scale = self._downscale_rgb(crop, MAX_FACE_CROP_EDGE)
-            ct = max(0, int(round((top - t) * scale)))
-            cr = min(crop.shape[1], int(round((right - l) * scale)))
-            cb = min(crop.shape[0], int(round((bottom - t) * scale)))
-            cl = max(0, int(round((left - l) * scale)))
-            if cr <= cl or cb <= ct:
-                return None
-            encs = face_recognition.face_encodings(
-                crop, known_face_locations=[(ct, cr, cb, cl)], num_jitters=0
-            )
-            return encs[0] if encs else None
-        except Exception as exc:
-            print(f"Face encoding failed: {exc}")
-            return None
 
     def recognize_classroom(
         self,
@@ -1221,21 +864,25 @@ class ClassroomAttendanceSystem:
 
         classroom_image = face_recognition.load_image_file(classroom_image_path)
         classroom_image = np.ascontiguousarray(classroom_image)
-        # Keep the recognition image bounded. This is especially important on
-        # Railway where camera photos can be 4K+ and dlib temporarily allocates
-        # substantial memory while encoding faces.
-        classroom_image, image_scale = self._downscale_rgb(classroom_image, MAX_DETECT_EDGE)
+        classroom_image_cv = cv2.cvtColor(classroom_image, cv2.COLOR_RGB2BGR)
 
         face_locations = self._detect_face_locations(classroom_image)
 
-        # Encode sequentially from small face crops. The previous implementation
-        # called face_encodings() for every face on the full classroom image in one
-        # batch, which can exhaust a small Railway container on 29+ faces.
+        # Batch encode all detected faces safely
         face_encodings_by_index = {}
-        for idx, location in enumerate(face_locations):
-            face_encodings_by_index[idx] = self._encode_face_one_at_a_time(classroom_image, location)
-            if idx and idx % 5 == 0:
-                gc.collect()
+        if face_locations:
+            try:
+                encodings = face_recognition.face_encodings(
+                    classroom_image, 
+                    known_face_locations=face_locations, 
+                    num_jitters=1
+                )
+                for idx, enc in enumerate(encodings):
+                    face_encodings_by_index[idx] = enc
+            except Exception as e:
+                print(f"Face encoding error: {e}")
+                for idx in range(len(face_locations)):
+                    face_encodings_by_index[idx] = None
 
         assignments = {}
         if has_registered_faces:
@@ -1248,8 +895,6 @@ class ClassroomAttendanceSystem:
         present_student_ids = []
         unknown_faces = 0
         face_details = []
-        annotated_rgb = np.ascontiguousarray(classroom_image)
-        annotated_bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
 
         for face_index, location in enumerate(face_locations):
             top, right, bottom, left = location
@@ -1283,20 +928,20 @@ class ClassroomAttendanceSystem:
 
             # Draw green for recognized, red for unknown
             color = (0, 255, 0) if student_id is not None else (0, 0, 255)
-            cv2.rectangle(annotated_bgr, (left, top), (right, bottom), color, 2)
+            cv2.rectangle(classroom_image_cv, (left, top), (right, bottom), color, 3)
 
             label = f"{name} ({confidence:.0%})" if student_id is not None else "Unknown"
             label_y = max(top - 10, 20)
             (w_txt, h_txt), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.55, 1)
             cv2.rectangle(
-                annotated_bgr,
+                classroom_image_cv,
                 (left, label_y - h_txt - 4),
                 (left + w_txt + 6, label_y + 4),
                 color,
                 cv2.FILLED,
             )
             cv2.putText(
-                annotated_bgr,
+                classroom_image_cv,
                 label,
                 (left + 3, label_y - 2),
                 cv2.FONT_HERSHEY_DUPLEX,
@@ -1337,14 +982,14 @@ class ClassroomAttendanceSystem:
         }
 
         os.makedirs("output", exist_ok=True)
-        annotated_path = f"output/annotated_classroom_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-        cv2.imwrite(annotated_path, annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        annotated_path = f"output/annotated_classroom_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        cv2.imwrite(annotated_path, classroom_image_cv)
         attendance_data["annotated_image_path"] = annotated_path
         attendance_data["annotated_image_base64"] = self._encode_bgr_jpeg_base64(
-            annotated_bgr, quality=68, max_edge=MAX_ANNOTATED_EDGE
+            classroom_image_cv, quality=72, max_edge=MAX_ANNOTATED_EDGE
         )
 
-        del annotated_rgb, annotated_bgr, classroom_image
+        del classroom_image
         gc.collect()
 
         result_message = (

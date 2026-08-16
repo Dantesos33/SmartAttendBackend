@@ -13,7 +13,7 @@ python-dotenv
 
 # Recognition engine dependencies
 face_recognition
-opencv-python-headless
+opencv-contrib-python-headless
 pillow
 numpy
 pandas
