@@ -1,4 +1,5 @@
 import os
+import gc
 import shutil
 import json
 import uuid
@@ -178,6 +179,28 @@ def check_faces_stage(
     image = face_recognition.load_image_file(job["image_path"])
     rgb = np.ascontiguousarray(image)
     face_locations = [tuple(x) for x in job["face_locations"]]
+
+    # Stage 1 may receive a 4K/8K camera image. Keep Stage 2 bounded too.
+    # Map the Stage-1 coordinates into the bounded image before any encoding.
+    max_edge = 1800
+    original_h, original_w = rgb.shape[:2]
+    if max(original_h, original_w) > max_edge:
+        scale = max_edge / float(max(original_h, original_w))
+        rgb = cv2.resize(
+            rgb,
+            (max(1, int(round(original_w * scale))), max(1, int(round(original_h * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        face_locations = [
+            (
+                int(round(t * scale)),
+                int(round(r * scale)),
+                int(round(b * scale)),
+                int(round(l * scale)),
+            )
+            for t, r, b, l in face_locations
+        ]
+    rgb = np.ascontiguousarray(rgb)
     results = []
     for i, loc in enumerate(face_locations):
         top, right, bottom, left = loc
@@ -190,15 +213,17 @@ def check_faces_stage(
             rgb, loc, encoding_available=False
         )
         encoding = None
-        if status != "masked":
-            try:
-                encs = face_recognition.face_encodings(
-                    rgb, known_face_locations=[loc], num_jitters=1
-                )
-                if encs:
-                    encoding = [float(x) for x in encs[0]]
-            except Exception as exc:
-                print(f"Face encoding failed for face {i}: {exc}")
+        try:
+            # Keep the memory-safe one-face-at-a-time encoder for BOTH clear and
+            # covered faces.  A mask/niqab is a detection/recognition challenge,
+            # not a reason to discard the face before matching.  The final 50%
+            # confidence floor still protects attendance from weak matches.
+            enc = attendance_system._encode_face_one_at_a_time(rgb, loc)
+            if enc is not None:
+                encoding = [float(x) for x in enc]
+            del enc
+        except Exception as exc:
+            print(f"Face encoding failed for face {i} ({status}): {exc}")
 
         # Small JPEG crops keep the review payload bounded for large group
         # photos. They remain large enough for the optional Add Student flow.
@@ -214,6 +239,12 @@ def check_faces_stage(
             "location": {"top": top, "right": right, "bottom": bottom, "left": left},
             "encoding": encoding, "crop_base64": crop,
         })
+
+        # Release temporary OpenCV/dlib allocations during large classroom
+        # batches instead of waiting until the whole request finishes.
+        del crop
+        if i % 3 == 0:
+            gc.collect()
     job["faces"] = results
     job["stage"] = "faces_checked"
     _save_job(job_id, job)
@@ -238,13 +269,13 @@ def check_enrollment_stage(
     # Match all clear faces globally, not one face at a time. This prevents the
     # same enrolled student from being assigned to multiple detected faces and
     # prevents a loose threshold from marking unrelated people present.
-    clear_encodings = {
+    matchable_encodings = {
         int(face["face_index"]): np.array(face["encoding"], dtype=np.float64)
         for face in job["faces"]
-        if face["face_status"] == "clear" and face.get("encoding")
+        if face.get("encoding")
     }
     assignments = attendance_system._assign_faces_to_students(
-        clear_encodings,
+        matchable_encodings,
         tolerance=float(tolerance),
         allowed_set=allowed_set,
         min_confidence=0.50,
@@ -259,18 +290,22 @@ def check_enrollment_stage(
         confidence = 0.0
         status = face["face_status"]
 
-        # Masked/occluded faces are intentionally treated as unrecognized for
-        # attendance. They must never be marked Present because their visible
-        # facial information is insufficient for reliable identity matching.
-        if status == "masked":
-            name = "Unrecognized"
-            status = "unrecognized"
-        elif face_index in assignments:
+        # Covered faces are still eligible for matching.  The engine now uses
+        # YuNet eye support to keep the detection box on the eyes/face and then
+        # attempts a memory-safe embedding.  Recognition is accepted only at
+        # the existing hard 50% confidence floor, so a weak masked-face match
+        # remains Unrecognized rather than being forced into an identity.
+        if face_index in assignments:
             student_id, name, confidence = assignments[face_index]
-            if student_id is None:
+            if student_id is None or confidence < 0.50:
+                student_id = None
                 name = "Unrecognized"
+                confidence = 0.0
             elif student_id not in present_ids:
                 present_ids.append(student_id)
+        elif status == "masked":
+            name = "Unrecognized"
+            status = "masked"
 
         final_faces.append({
             "face_index": face_index, "student_id": student_id, "name": name,
