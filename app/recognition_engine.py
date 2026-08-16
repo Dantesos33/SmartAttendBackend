@@ -295,42 +295,43 @@ class ClassroomAttendanceSystem:
             return []
 
 
-    def classify_face_visibility(self, rgb_image, location, encoding_available=False):
-        """Stage-2 visibility classification, based on eyes visibility only.
+    def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
+        """Stage-2 mask/occlusion classification only.
 
-        Detection is intentionally NOT performed here.  The detector (Stage 1,
-        ``_detect_face_locations``) has a protected baseline and is never
-        touched by this method — it only interprets an already detected box.
-        The old upper-face-region/lower-face-region brightness+edge occlusion
-        scoring has been removed in favor of a simple, direct check.
+        Detection is intentionally NOT performed here.  The detector has a
+        protected baseline and this method only decides whether an already
+        detected face has strong evidence of lower-face covering.
 
-        Returns one of:
-          * ``"clear"``        - the face is fully visible: eyes, nose, and
-            mouth are all visible. Proceeds to normal recognition/matching.
-          * ``"masked"``       - the eyes are visible but the face is not
-            fully visible (mask, niqab, hand, partial occlusion, etc.).
-            These faces are kept in the results but are always treated as
-            unrecognized for attendance — they are never matched to an
-            identity.
-          * ``"insufficient"`` - the eyes are not visible at all (e.g. only a
-            lower-face fragment such as the mouth/chin/jaw, a cheek, an ear,
-            or the back/side of a head is visible). These detections are
-            dropped entirely — removed from the results and from the total
-            detected-face count.
+        The classifier uses several independent cues and a small landmark
+        upscale pass.  This is deliberately conservative: one weak cue must
+        never turn a normal face into ``masked``.
         """
         top, right, bottom, left = [int(x) for x in location]
         h, w = rgb_image.shape[:2]
         top, left = max(0, top), max(0, left)
         bottom, right = min(h, bottom), min(w, right)
         if bottom <= top or right <= left:
-            return "insufficient"
+            return "clear"
 
         crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
         ch, cw = crop.shape[:2]
-        if ch < 10 or cw < 10:
-            return "insufficient"
+        if ch < 36 or cw < 24:
+            return "clear"
 
         try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+            upper = gray[int(ch * 0.15):int(ch * 0.52), int(cw * 0.08):int(cw * 0.92)]
+            lower = gray[int(ch * 0.48):int(ch * 0.90), int(cw * 0.08):int(cw * 0.92)]
+            if upper.size == 0 or lower.size == 0:
+                return "clear"
+
+            upper_mean, lower_mean = float(np.mean(upper)), float(np.mean(lower))
+            upper_std, lower_std = float(np.std(upper)), float(np.std(lower))
+            ue = cv2.Canny(upper, 50, 130)
+            le = cv2.Canny(lower, 50, 130)
+            upper_edges = float(np.mean(ue > 0))
+            lower_edges = float(np.mean(le > 0))
+
             # Landmarks are unreliable on tiny classroom faces at native size.
             # Upscale only this small crop; this does not affect Stage-1 detection.
             landmark_crop = crop
@@ -340,122 +341,62 @@ class ClassroomAttendanceSystem:
                     crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
                 )
 
-            lm_h, lm_w = landmark_crop.shape[:2]
-
             landmarks = {}
             try:
-                # Tell the landmark predictor exactly where the face is (the
-                # whole crop) instead of letting it re-run its own face
-                # detector on the crop first. Re-detection is what fails on
-                # masked/niqab faces — with much of the face covered, the
-                # internal detector often can't confirm a face is there at
-                # all, which was wrongly dropping legitimate masked faces as
-                # "insufficient". Stage-1 already found this face; we only
-                # need landmarks within that known region.
-                lm = face_recognition.face_landmarks(
-                    landmark_crop,
-                    face_locations=[(0, lm_w, lm_h, 0)],
-                    model="large",
-                )
+                lm = face_recognition.face_landmarks(landmark_crop, model="large")
                 if lm:
                     landmarks = lm[0]
             except Exception:
                 landmarks = {}
 
-            # Fall back to the predictor's own detection if forcing the full
-            # crop as the face location produced nothing (e.g. a very loose
-            # detection box with a lot of background margin).
-            if not landmarks:
-                try:
-                    lm = face_recognition.face_landmarks(landmark_crop, model="large")
-                    if lm:
-                        landmarks = lm[0]
-                except Exception:
-                    landmarks = {}
-
+            eyes = bool(landmarks.get("left_eye")) and bool(landmarks.get("right_eye"))
             mouth = bool(landmarks.get("top_lip")) or bool(landmarks.get("bottom_lip"))
             nose = bool(landmarks.get("nose_bridge")) or bool(landmarks.get("nose_tip"))
 
-            # Forcing a face location makes the predictor fit points even on
-            # crops that don't actually contain eyes (a mouth/chin fragment,
-            # an ear, etc.) — it doesn't verify anything is really there.
-            # Validate the eye points before trusting them: they must sit in
-            # the upper part of the crop, be plausibly spread apart, and land
-            # on real local contrast (an iris/sclera edge), not a flat patch.
-            gray_lm = cv2.cvtColor(landmark_crop, cv2.COLOR_RGB2GRAY)
-            eyes = self._eye_landmarks_are_real(landmarks, gray_lm, lm_w, lm_h)
+            # Score independent signals instead of relying on one brittle rule.
+            score = 0
 
-            # Eyes not visible at all: not a usable attendance detection.
-            if not eyes:
-                return "insufficient"
+            # Eyes visible but mouth structure missing is a strong occlusion cue.
+            if eyes and not mouth:
+                score += 2
 
-            # Eyes visible, and the rest of the face (nose + mouth) is also
-            # visible: this is a fully visible, normal face.
-            if eyes and mouth and nose:
-                return "clear"
+            # If eyes are visible but both mouth and nose structure are absent,
+            # this is particularly useful for niqab/face-covering cases.
+            if eyes and not mouth and not nose:
+                score += 2
 
-            # Eyes visible but the face is not fully visible (partial
-            # occlusion, mask, niqab, cropped edge, etc.).
-            return "masked"
+            # Covered lower faces are commonly flatter/less textured than the
+            # upper face.  Require a meaningful relative difference, not a fixed
+            # brightness threshold so lighting/skin tone do not dominate.
+            texture_flat = (
+                lower_std < max(upper_std * 0.78, 9.0) and
+                lower_edges < max(upper_edges * 0.72, 0.016)
+            )
+            if texture_flat:
+                score += 1
+
+            # A dark/opaque lower covering is an additional cue, but it is never
+            # sufficient by itself because shadows and hair can look similar.
+            dark_cover = (
+                upper_mean > 45 and
+                lower_mean < upper_mean * 0.72 and
+                lower_std < max(upper_std * 0.82, 9.0)
+            )
+            if dark_cover:
+                score += 1
+
+            # Very low lower-face detail combined with visible eyes is useful for
+            # masks/niqabs even when the landmark detector only finds the eyes.
+            if eyes and lower_edges < max(upper_edges * 0.82, 0.018):
+                score += 1
+
+            # Require strong evidence.  This reduces false positives on sideways,
+            # downward-facing and low-resolution clear faces.
+            if score >= 3:
+                return "masked"
+            return "clear"
         except Exception:
-            return "insufficient"
-
-    @staticmethod
-    def _eye_landmarks_are_real(landmarks, gray_crop, lm_w, lm_h):
-        """Sanity-check eye landmark points instead of trusting them blindly.
-
-        When the landmark predictor is given a forced face location it will
-        fit points even on crops that have no eyes in them at all, so a
-        plain "was left_eye/right_eye present" check is not enough. This
-        verifies the points are geometrically plausible (in the upper part
-        of the crop, spread apart like a real eye pair) and sit over genuine
-        local contrast (an iris/sclera boundary), not a flat, featureless
-        patch of skin, hair, or fabric.
-        """
-        left_eye = landmarks.get("left_eye") or []
-        right_eye = landmarks.get("right_eye") or []
-        pts = list(left_eye) + list(right_eye)
-        if not pts or lm_h <= 0 or lm_w <= 0:
-            return False
-
-        # Eyes belong in the upper part of a face crop. A fit whose points
-        # sit in the lower half is a strong sign of a hallucinated match on
-        # a mouth/chin-only fragment.
-        avg_y_ratio = (sum(p[1] for p in pts) / len(pts)) / lm_h
-        if avg_y_ratio > 0.62:
-            return False
-
-        # If both eyes were found, they should be spread apart by a plausible
-        # fraction of the face width, not collapsed together.
-        if left_eye and right_eye:
-            lx = sum(p[0] for p in left_eye) / len(left_eye)
-            rx = sum(p[0] for p in right_eye) / len(right_eye)
-            if abs(rx - lx) < lm_w * 0.12:
-                return False
-
-        # Require real local contrast under each eye point.
-        for (px, py) in pts:
-            x0, x1 = max(0, px - 4), min(lm_w, px + 4)
-            y0, y1 = max(0, py - 4), min(lm_h, py + 4)
-            if x1 <= x0 or y1 <= y0:
-                continue
-            patch = gray_crop[y0:y1, x0:x1]
-            if patch.size and float(np.std(patch)) < 8.0:
-                return False
-
-        return True
-
-    def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
-        """Backward-compatible binary wrapper around ``classify_face_visibility``.
-
-        Kept for any caller that only understands clear/masked. New code
-        should call ``classify_face_visibility`` directly to also get the
-        "insufficient" (eyes not visible) state.
-        """
-        visibility = self.classify_face_visibility(
-            rgb_image, location, encoding_available=encoding_available
-        )
-        return "masked" if visibility in ("masked", "insufficient") else "clear"
+            return "clear"
 
     @staticmethod
     def _fallback_occlusion_classification(rgb_crop):
@@ -723,20 +664,19 @@ class ClassroomAttendanceSystem:
         allowed_set: set | None,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> dict[int, tuple[int | None, str, float]]:
-        """Assign clear detected faces to enrolled students without duplicates.
+        """Assign every detected face to an enrolled student without duplicates.
 
-        Recognition is intentionally independent from Stage-1 detection.  This
-        matcher is tuned for classroom photos where an enrolled student's face
-        can be farther from the profile-photo embedding because of distance,
-        pose, lighting, or expression.  We therefore use a two-tier acceptance
-        rule instead of a single overly-strict threshold:
+        Recognition is intentionally independent from Stage-1 detection, and
+        every detected face (including ones whose lower face is partly
+        covered) is checked here — none are pre-filtered out before this
+        step. Assignment is global and one-to-one so the same student cannot
+        be marked present for multiple detected faces.
 
-        * strong matches are accepted directly;
-        * weaker matches are accepted only when they have a clear margin over
-          the next-best student for that face.
-
-        Assignment is global and one-to-one so the same student cannot be marked
-        present for multiple detected faces.
+        Acceptance rule (simple and explicit): a face's match confidence is
+        ``1 - distance`` against its closest enrolled student. If that
+        confidence is 50% or higher, the face is recognised as that student.
+        If it is below 50%, the face is left unmatched and is reported as
+        unrecognized rather than being forced into an identity.
         """
         if not face_encodings_by_index or not self.known_face_encodings:
             return {i: (None, "Unknown", 0.0) for i in face_encodings_by_index}
@@ -778,9 +718,8 @@ class ClassroomAttendanceSystem:
             options.sort(key=lambda item: item[0])
             candidates_by_face[face_index] = options
 
-        # Convert each face's candidate list into an acceptance candidate.  A
-        # relaxed match is allowed for difficult classroom faces only when the
-        # best student is clearly separated from the second-best student.
+        # Convert each face's candidate list into an acceptance candidate
+        # using the 50%-confidence rule described above.
         candidates = []
         for face_index, options in candidates_by_face.items():
             if not options:
@@ -788,28 +727,11 @@ class ClassroomAttendanceSystem:
 
             best = options[0]
             best_distance, sid, name, confidence = best
-            second_distance = options[1][0] if len(options) > 1 else float("inf")
-            margin = second_distance - best_distance
 
-            strong_limit = min(float(tolerance), 0.58)
-            relaxed_limit = max(float(tolerance), 0.62)
-
-            # A face is only ever accepted as a match at 50% confidence or
-            # above. Anything under that bar is left unassigned and the face
-            # is reported as Unrecognized rather than risking a wrong name.
-            floor = max(0.50, float(min_confidence))
-
-            accepted = False
-            if best_distance <= strong_limit and confidence >= floor:
-                accepted = True
-            elif (
-                best_distance <= relaxed_limit
-                and confidence >= floor
-                and margin >= 0.075
-            ):
-                accepted = True
-
-            if accepted:
+            # Percentage-based acceptance: confidence is 1 - distance,
+            # expressed as a percentage. >= 50% => recognised, < 50% => left
+            # unmatched (unrecognized).
+            if confidence >= float(min_confidence):
                 candidates.append(
                     (best_distance, face_index, sid, name, confidence)
                 )

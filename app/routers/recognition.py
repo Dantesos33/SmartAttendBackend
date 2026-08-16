@@ -170,38 +170,15 @@ def check_faces_stage(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
-    """Stage 2: classify detected faces as masked/clear and prepare clear-face embeddings.
-
-    Detection itself (Stage 1) is untouched here — this stage only interprets
-    the boxes it already received. Every candidate is passed through
-    ``classify_face_visibility``, which is now based on eyes visibility only:
-      * "insufficient" (eyes not visible — e.g. only a lower-face fragment,
-        cheek, ear, or the back/side of a head) is dropped entirely and does
-        not appear in the results or the total face count.
-      * "masked" (eyes visible, but the face is not fully visible) is kept
-        and always reported as unrecognized further down the pipeline.
-      * "clear" (eyes, nose, and mouth all visible — a fully visible face)
-        is kept and proceeds to normal recognition.
-    """
+    """Stage 2: label detected faces as masked/clear (informational only) and compute an embedding for every face, including masked ones, so all of them can be checked against enrollment in the next stage."""
     job = _load_job(job_id)
     section = _validate_section(db, job["section_id"], current_user)
     image = face_recognition.load_image_file(job["image_path"])
     rgb = np.ascontiguousarray(image)
     face_locations = [tuple(x) for x in job["face_locations"]]
     results = []
-    dropped_insufficient = 0
     for i, loc in enumerate(face_locations):
         top, right, bottom, left = loc
-
-        # Visibility/occlusion is decided from the image region alone, before
-        # encoding is attempted, so a face with no meaningful upper-face
-        # evidence is removed from the count regardless of whether it could
-        # be encoded.
-        visibility = attendance_system.classify_face_visibility(rgb, loc)
-        if visibility == "insufficient":
-            dropped_insufficient += 1
-            continue
-
         encoding = None
         try:
             encs = face_recognition.face_encodings(rgb, known_face_locations=[loc], num_jitters=2)
@@ -210,9 +187,12 @@ def check_faces_stage(
         except Exception as exc:
             print(f"Face encoding failed for face {i}: {exc}")
 
-        # Detection is already complete. A face that cannot be encoded is kept
-        # as masked/occluded rather than being dropped from attendance.
-        status = visibility  # "clear" or "masked"
+        # Detection is already complete. The masked/clear label is kept for
+        # display purposes only — it no longer removes a face from the
+        # enrollment-matching step in Stage 3.
+        status = attendance_system.classify_face_occlusion(
+            rgb, loc, encoding_available=encoding is not None
+        )
         try:
             crop = attendance_system._encode_rgb_crop_base64(
                 rgb, top, right, bottom, left, quality=96, padded=True
@@ -226,17 +206,9 @@ def check_faces_stage(
             "encoding": encoding, "crop_base64": crop,
         })
     job["faces"] = results
-    job["dropped_insufficient_faces"] = dropped_insufficient
     job["stage"] = "faces_checked"
     _save_job(job_id, job)
-    return {
-        "status": "success", "job_id": job_id, "stage": "checking_faces",
-        "data": {
-            "faces": [{k: v for k, v in f.items() if k != "encoding"} for f in results],
-            "faces_detected": len(results),
-            "dropped_insufficient_faces": dropped_insufficient,
-        },
-    }
+    return {"status": "success", "job_id": job_id, "stage": "checking_faces", "data": {"faces": [{k:v for k,v in f.items() if k != "encoding"} for f in results]}}
 
 @router.post("/recognize/check-enrollment")
 def check_enrollment_stage(
@@ -245,7 +217,7 @@ def check_enrollment_stage(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(UserRole.teacher, UserRole.admin)),
 ):
-    """Stage 3/4: match clear faces ONLY against this section, then calculate present/absent."""
+    """Stage 3/4: match every detected face (clear or masked) against this section's enrolled students at a 50% confidence threshold, then calculate present/absent."""
     job = _load_job(job_id)
     section = _validate_section(db, job["section_id"], current_user)
     allowed_student_ids = [row.student_id for row in db.query(Enrollment.student_id).filter(Enrollment.section_id == section.id).all()]
@@ -254,16 +226,19 @@ def check_enrollment_stage(
     attendance_system.prepare_known_faces(db_encoding_rows=rows, allowed_student_ids=allowed_student_ids)
     allowed_set = set(allowed_student_ids)
 
-    # Match all clear faces globally, not one face at a time. This prevents the
-    # same enrolled student from being assigned to multiple detected faces and
-    # prevents a loose threshold from marking unrelated people present.
-    clear_encodings = {
+    # Match every detected face globally (not one face at a time), regardless
+    # of whether it was flagged as "clear" or "masked" — a partially covered
+    # lower face is still attempted against the enrolled section instead of
+    # being discarded up front. This prevents the same enrolled student from
+    # being assigned to multiple detected faces and prevents a loose
+    # threshold from marking unrelated people present.
+    all_encodings = {
         int(face["face_index"]): np.array(face["encoding"], dtype=np.float64)
         for face in job["faces"]
-        if face["face_status"] == "clear" and face.get("encoding")
+        if face.get("encoding")
     }
     assignments = attendance_system._assign_faces_to_students(
-        clear_encodings,
+        all_encodings,
         tolerance=float(tolerance),
         allowed_set=allowed_set,
         min_confidence=0.50,
@@ -278,13 +253,11 @@ def check_enrollment_stage(
         confidence = 0.0
         status = face["face_status"]
 
-        # Masked/occluded faces are intentionally treated as unrecognized for
-        # attendance. They must never be marked Present because their visible
-        # facial information is insufficient for reliable identity matching.
-        if status == "masked":
-            name = "Unrecognized"
-            status = "unrecognized"
-        elif face_index in assignments:
+        # Every detected face — clear or masked — is checked against the
+        # section's enrolled students. A match is accepted only when the
+        # recognition confidence is 50% or higher; below that the face is
+        # reported as unrecognized rather than being forced into an identity.
+        if face_index in assignments:
             student_id, name, confidence = assignments[face_index]
             if student_id is None:
                 name = "Unrecognized"
@@ -294,7 +267,7 @@ def check_enrollment_stage(
         final_faces.append({
             "face_index": face_index, "student_id": student_id, "name": name,
             "confidence": float(confidence), "face_status": status,
-            "attendance_status": "unrecognized" if status == "unrecognized" else ("present" if student_id else "unrecognized"),
+            "attendance_status": "present" if student_id else "unrecognized",
             "location": face["location"], "crop_base64": face.get("crop_base64"),
         })
     absent_ids = [sid for sid in allowed_student_ids if sid not in present_ids]
@@ -303,7 +276,7 @@ def check_enrollment_stage(
     for face in final_faces:
         loc = face["location"]; top,right,bottom,left = loc["top"],loc["right"],loc["bottom"],loc["left"]
         status = face["attendance_status"]
-        color = (0,255,0) if status == "present" else ((0,165,255) if status == "masked" else (0,0,255))
+        color = (0,255,0) if status == "present" else (0,0,255)
         label = face["name"] if status != "present" else f"{face['name']} ({face['confidence']:.0%})"
         cv2.rectangle(annotated, (left,top), (right,bottom), color, 3)
         y=max(top-8,20); (tw,th),_=cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX,.55,1)
@@ -314,8 +287,7 @@ def check_enrollment_stage(
     result = {
         "section_id": section.id, "faces_detected": len(final_faces), "present_student_ids": present_ids,
         "absent_student_ids": absent_ids, "present_count": len(present_ids), "absent_count": len(absent_ids),
-        "masked_count": sum(1 for f in final_faces if f["face_status"] == "masked"),
-        "dropped_insufficient_faces": job.get("dropped_insufficient_faces", 0),
+        "masked_count": 0,
         "unknown_faces": sum(1 for f in final_faces if f["attendance_status"] == "unrecognized"),
         "face_details": final_faces, "annotated_image_base64": annotated_b64,
         "enrolled_with_face_photos": len(attendance_system.known_face_ids), "recognition_available": bool(attendance_system.known_face_encodings),
