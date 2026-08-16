@@ -243,26 +243,46 @@ class ClassroomAttendanceSystem:
         YuNet is used instead of Haar Cascade because some Railway OpenCV builds do
         not expose CascadeClassifier. It is also substantially better for small,
         partially occluded and non-frontal faces.
+
+        The model is fetched over the network on first use, so a slow or
+        blocked connection to the model host can silently remove YuNet from
+        the detection pipeline. To keep detection reliable, this retries the
+        download a few times with a timeout instead of failing on the first
+        hiccup, and clearly logs success/failure so a drop in detected faces
+        can be diagnosed from the logs.
         """
         if not hasattr(cv2, "FaceDetectorYN"):
+            print("YuNet unavailable: this OpenCV build has no FaceDetectorYN.")
             return None
         os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True)
         if not os.path.exists(YUNET_MODEL_PATH):
             tmp = YUNET_MODEL_PATH + ".download"
-            try:
-                with self._yunet_lock:
-                    if not os.path.exists(YUNET_MODEL_PATH):
-                        print("Downloading YuNet face detector model...")
-                        urllib.request.urlretrieve(YUNET_MODEL_URL, tmp)
-                        os.replace(tmp, YUNET_MODEL_PATH)
-            except Exception as exc:
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except Exception:
-                    pass
-                print(f"YuNet model download failed: {exc}")
-                return None
+            with self._yunet_lock:
+                if not os.path.exists(YUNET_MODEL_PATH):
+                    last_exc = None
+                    for attempt in range(1, 4):
+                        try:
+                            print(f"Downloading YuNet face detector model (attempt {attempt}/3)...")
+                            with urllib.request.urlopen(YUNET_MODEL_URL, timeout=15) as resp, open(tmp, "wb") as out:
+                                out.write(resp.read())
+                            os.replace(tmp, YUNET_MODEL_PATH)
+                            print("YuNet model downloaded successfully.")
+                            last_exc = None
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            try:
+                                if os.path.exists(tmp):
+                                    os.remove(tmp)
+                            except Exception:
+                                pass
+                    if last_exc is not None:
+                        print(
+                            f"YuNet model download failed after 3 attempts: {last_exc}. "
+                            "Detection will fall back to HOG-only passes, which typically "
+                            "misses more small/angled classroom faces."
+                        )
+                        return None
         try:
             detector = cv2.FaceDetectorYN.create(
                 YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
@@ -285,10 +305,54 @@ class ClassroomAttendanceSystem:
                 return []
             results = []
             for row in detections:
-                x, y, bw, bh, score = [float(v) for v in row[:5]]
+                vals = [float(v) for v in row]
+                if len(vals) < 15:
+                    # Malformed row; fall back to bbox-only, no landmarks.
+                    x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
+                    score = vals[4] if len(vals) > 4 else 1.0
+                else:
+                    # OpenCV FaceDetectorYN row layout:
+                    # [x, y, w, h, re_x, re_y, le_x, le_y, nose_x, nose_y,
+                    #  rmc_x, rmc_y, lmc_x, lmc_y, score]
+                    # The confidence score is the LAST value, not index 4 —
+                    # index 4 is the right-eye x-coordinate. Reading it as a
+                    # score silently disabled this filter and, more
+                    # importantly, meant a poorly-fit box was never corrected.
+                    x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
+                    right_eye_x, right_eye_y = vals[4], vals[5]
+                    left_eye_x, left_eye_y = vals[6], vals[7]
+                    score = vals[14]
+
                 if score < 0.35 or bw < 10 or bh < 10:
                     continue
-                results.append((int(y), int(x+bw), int(y+bh), int(x)))
+
+                if len(vals) >= 15:
+                    # For faces with a covered lower half (niqab/mask), the
+                    # raw box regression is trained on full, unmasked faces
+                    # and can end up sitting too high — tight around only the
+                    # visible eye strip, with the box "floating" above where
+                    # the face actually is. The eye landmarks stay reliable
+                    # even when the lower face is covered, so use them to
+                    # re-anchor the box whenever the raw box clearly isn't
+                    # centered on the eyes the way a normal face box would be.
+                    interocular = abs(left_eye_x - right_eye_x)
+                    if interocular > 2 and bh > 0:
+                        eye_cx = (right_eye_x + left_eye_x) / 2.0
+                        eye_cy = (right_eye_y + left_eye_y) / 2.0
+                        eye_frac_y = (eye_cy - y) / bh
+                        # A well-fit face box has the eyes roughly 35-55% down
+                        # from its top. Outside that band the box is likely
+                        # mis-anchored — rebuild it around the eyes using
+                        # standard face proportions instead of trusting the
+                        # raw regression.
+                        if eye_frac_y < 0.30 or eye_frac_y > 0.60:
+                            face_w = max(bw, interocular * 2.2)
+                            face_h = face_w * 1.15
+                            x = eye_cx - face_w / 2.0
+                            y = eye_cy - face_h * 0.40
+                            bw, bh = face_w, face_h
+
+                results.append((int(y), int(x + bw), int(y + bh), int(x)))
             return results
         except Exception as exc:
             print(f"YuNet detection failed: {exc}")
@@ -578,20 +642,24 @@ class ClassroomAttendanceSystem:
             )
 
         # 1) Primary frontal HOG.
+        pass1_count = 0
         try:
             for loc in face_recognition.face_locations(
                 detect_img, number_of_times_to_upsample=1, model="hog"
             ):
                 raw.append(restore(loc))
+                pass1_count += 1
         except Exception as exc:
             print(f"Primary HOG detection failed: {exc}")
 
         # 2) YuNet is the primary recovery detector. It handles small,
         # partially occluded, profile and masked faces much better than Haar.
+        pass2_count = 0
         try:
             yunet_input = cv2.cvtColor(detect_img, cv2.COLOR_RGB2BGR)
             for loc in self._yunet_locations(yunet_input):
                 raw.append(restore(loc))
+                pass2_count += 1
             del yunet_input
         except Exception as exc:
             print(f"YuNet recovery failed: {exc}")
@@ -601,6 +669,7 @@ class ClassroomAttendanceSystem:
         # miss those, while a sequential overlapping tile gives the detector
         # much more face resolution without the memory cost of full-image
         # upsample=2/3.
+        pass3_count = 0
         th, tw = detect_img.shape[:2]
         tile_w = max(420, int(tw * 0.62))
         tile_h = max(360, int(th * 0.62))
@@ -620,12 +689,14 @@ class ClassroomAttendanceSystem:
                     ):
                         t, r, b, l = loc
                         raw.append(restore((t+y0, r+x0, b+y0, l+x0)))
+                        pass3_count += 1
                 except Exception as exc:
                     print(f"HOG tile detection failed at ({x0},{y0}): {exc}")
                 del tile
                 gc.collect()
 
         # 4) Orientation recovery.
+        pass4_count = 0
         for rotation, rotated in (
             ("cw", cv2.rotate(detect_img, cv2.ROTATE_90_CLOCKWISE)),
             ("ccw", cv2.rotate(detect_img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
@@ -636,6 +707,7 @@ class ClassroomAttendanceSystem:
                 ):
                     mapped = self._map_rotated_location(loc, detect_img.shape, rotation)
                     raw.append(restore(mapped))
+                    pass4_count += 1
             except Exception as exc:
                 print(f"Rotated HOG ({rotation}) failed: {exc}")
             del rotated
@@ -643,18 +715,32 @@ class ClassroomAttendanceSystem:
 
         # 5) A second YuNet pass on a 1.35x image catches distant/partially
         # occluded faces that are below the effective size of the first pass.
+        pass5_count = 0
         try:
             enlarged = cv2.resize(detect_img, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
             for loc in self._yunet_locations(cv2.cvtColor(enlarged, cv2.COLOR_RGB2BGR)):
                 t,r,b,l = loc
                 raw.append(restore((int(t/1.35), int(r/1.35), int(b/1.35), int(l/1.35))))
+                pass5_count += 1
             del enlarged
             gc.collect()
         except Exception as exc:
             print(f"Enlarged YuNet recovery failed: {exc}")
 
         final_locations = self._dedupe_face_locations(raw, original.shape)
-        print(f"Detected {len(final_locations)} face(s) in image.")
+        print(
+            f"Detection pass breakdown -> primary_hog={pass1_count}, "
+            f"yunet_pass1={pass2_count}, tile_hog={pass3_count}, "
+            f"rotated_hog={pass4_count}, yunet_pass2={pass5_count}, "
+            f"raw_total={len(raw)}, after_dedupe={len(final_locations)}"
+        )
+        if pass2_count == 0 and pass5_count == 0:
+            print(
+                "WARNING: both YuNet passes returned 0 faces this run. If this "
+                "is unexpected, check the earlier 'YuNet' log lines above for a "
+                "download/initialization failure — YuNet is usually the biggest "
+                "contributor of small/angled faces in group photos."
+            )
         return final_locations
 
     def _assign_faces_to_students(
