@@ -264,8 +264,10 @@ class ClassroomAttendanceSystem:
                 sr = cv2.dnn_superres.DnnSuperResImpl_create()
                 sr.readModel(SR_MODEL_PATH)
                 sr.setModel("fsrcnn", 2)
-                sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                # Do not explicitly call setPreferableTarget/setPreferableBackend.
+                # Newer OpenCV graph engines can emit:
+                # "Targets are not supported by the new graph engine for now".
+                # The default backend/target is sufficient and avoids that warning.
                 self._sr_model = sr
                 print("FSRCNN x2 face upscaler loaded.")
             except Exception as exc:
