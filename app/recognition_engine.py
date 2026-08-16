@@ -327,27 +327,26 @@ class ClassroomAttendanceSystem:
                     continue
 
                 if len(vals) >= 15:
-                    # For faces with a covered lower half (niqab/mask), the
-                    # raw box regression is trained on full, unmasked faces
-                    # and can end up sitting too high — tight around only the
-                    # visible eye strip, with the box "floating" above where
-                    # the face actually is. The eye landmarks stay reliable
-                    # even when the lower face is covered, so use them to
-                    # re-anchor the box whenever the raw box clearly isn't
-                    # centered on the eyes the way a normal face box would be.
+                    # YuNet's eye landmarks are reliable even when a mask hides
+                    # the lower half. Use them to repair badly anchored boxes.
                     interocular = abs(left_eye_x - right_eye_x)
-                    if interocular > 2 and bh > 0:
+                    if interocular > 2:
                         eye_cx = (right_eye_x + left_eye_x) / 2.0
                         eye_cy = (right_eye_y + left_eye_y) / 2.0
-                        eye_frac_y = (eye_cy - y) / bh
-                        # A well-fit face box has the eyes roughly 35-55% down
-                        # from its top. Outside that band the box is likely
-                        # mis-anchored — rebuild it around the eyes using
-                        # standard face proportions instead of trusting the
-                        # raw regression.
-                        if eye_frac_y < 0.30 or eye_frac_y > 0.60:
-                            face_w = max(bw, interocular * 2.2)
-                            face_h = face_w * 1.15
+                        eye_frac_y = (eye_cy - y) / max(1.0, bh)
+
+                        # The raw YuNet box can become too small/high on masked
+                        # faces. Eye spacing gives a much more stable face scale.
+                        plausible_w = interocular * 2.35
+                        face_w = max(plausible_w, bw * 0.85)
+                        face_w = min(face_w, max(plausible_w * 1.65, bw * 1.25))
+
+                        if (
+                            eye_frac_y < 0.25
+                            or eye_frac_y > 0.58
+                            or bw < interocular * 1.65
+                        ):
+                            face_h = max(face_w * 1.22, interocular * 2.85)
                             x = eye_cx - face_w / 2.0
                             y = eye_cy - face_h * 0.40
                             bw, bh = face_w, face_h
@@ -614,6 +613,115 @@ class ClassroomAttendanceSystem:
         # because some production OpenCV builds omit CascadeClassifier.
         return []
 
+    @staticmethod
+    def _clamp_location(location, image_shape):
+        h, w = image_shape[:2]
+        top, right, bottom, left = [int(v) for v in location]
+        top = max(0, min(h - 1, top))
+        left = max(0, min(w - 1, left))
+        bottom = max(top + 1, min(h, bottom))
+        right = max(left + 1, min(w, right))
+        return (top, right, bottom, left)
+
+    def _face_focus_and_geometry(self, rgb_image, location):
+        """Measure local sharpness and whether the box contains face geometry."""
+        try:
+            top, right, bottom, left = self._clamp_location(location, rgb_image.shape)
+            crop = np.ascontiguousarray(rgb_image[top:bottom, left:right])
+            h, w = crop.shape[:2]
+            if h < 24 or w < 20:
+                return 0.0, 0.0, False
+
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+            y1, y2 = int(h * 0.12), int(h * 0.90)
+            x1, x2 = int(w * 0.10), int(w * 0.90)
+            roi = gray[y1:max(y1 + 1, y2), x1:max(x1 + 1, x2)]
+            if roi.size == 0:
+                roi = gray
+
+            focus = float(cv2.Laplacian(roi, cv2.CV_64F).var())
+
+            landmark_crop = crop
+            if max(h, w) < 180:
+                scale = min(4.0, 180.0 / max(h, w))
+                landmark_crop = cv2.resize(
+                    crop, None, fx=scale, fy=scale,
+                    interpolation=cv2.INTER_CUBIC
+                )
+
+            try:
+                landmarks = face_recognition.face_landmarks(
+                    landmark_crop, model="large"
+                )
+            except Exception:
+                landmarks = []
+
+            if not landmarks:
+                return focus, 0.0, False
+
+            lm = landmarks[0]
+            eyes = bool(lm.get("left_eye")) and bool(lm.get("right_eye"))
+            nose = bool(lm.get("nose_bridge")) or bool(lm.get("nose_tip"))
+            mouth = bool(lm.get("top_lip")) or bool(lm.get("bottom_lip"))
+
+            if eyes:
+                geometry = 1.0
+            elif nose and (mouth or bool(lm.get("left_eye")) or bool(lm.get("right_eye"))):
+                geometry = 0.75
+            else:
+                geometry = 0.25
+
+            return focus, geometry, eyes
+        except Exception:
+            return 0.0, 0.0, False
+
+    def _filter_face_locations(self, rgb_image, locations):
+        """Reject neck/background false positives and severely blurred faces."""
+        if not locations:
+            return []
+
+        scored = []
+        for loc in locations:
+            loc = self._clamp_location(loc, rgb_image.shape)
+            top, right, bottom, left = loc
+            area = max(1, (right - left) * (bottom - top))
+            focus, geometry, has_eyes = self._face_focus_and_geometry(
+                rgb_image, loc
+            )
+            scored.append((loc, focus, geometry, has_eyes, area))
+
+        best_focus = max((x[1] for x in scored), default=0.0)
+        kept = []
+
+        for loc, focus, geometry, has_eyes, area in scored:
+            top, right, bottom, left = loc
+            bw, bh = right - left, bottom - top
+            ratio = bw / float(max(1, bh))
+            tiny = min(bw, bh) < 42
+
+            # A neck/clothing false positive normally has no pair of eyes.
+            # Keep only tiny, sharp, compact candidates as an exception.
+            if geometry < 0.70:
+                if not (
+                    tiny
+                    and focus >= max(18.0, best_focus * 0.18)
+                    and 0.48 <= ratio <= 1.65
+                ):
+                    continue
+
+            relative_focus = focus / max(best_focus, 1.0)
+            # Strong eye geometry permits smaller/distant faces; weak geometry
+            # must be reasonably sharp to survive.
+            if geometry < 1.0 and relative_focus < 0.16:
+                continue
+            if geometry >= 1.0 and relative_focus < 0.07:
+                continue
+
+            kept.append(loc)
+
+        kept.sort(key=lambda x: (x[0], x[3]))
+        return kept
+
     def _detect_face_locations(self, rgb_image):
         """Detect faces independently of recognition, including difficult group-photo faces.
 
@@ -728,11 +836,14 @@ class ClassroomAttendanceSystem:
             print(f"Enlarged YuNet recovery failed: {exc}")
 
         final_locations = self._dedupe_face_locations(raw, original.shape)
+        before_quality = len(final_locations)
+        final_locations = self._filter_face_locations(original, final_locations)
         print(
             f"Detection pass breakdown -> primary_hog={pass1_count}, "
             f"yunet_pass1={pass2_count}, tile_hog={pass3_count}, "
             f"rotated_hog={pass4_count}, yunet_pass2={pass5_count}, "
-            f"raw_total={len(raw)}, after_dedupe={len(final_locations)}"
+            f"raw_total={len(raw)}, after_dedupe={before_quality}, "
+            f"after_quality={len(final_locations)}"
         )
         if pass2_count == 0 and pass5_count == 0:
             print(
