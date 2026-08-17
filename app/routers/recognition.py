@@ -213,17 +213,18 @@ def check_faces_stage(
             rgb, loc, encoding_available=False
         )
         encoding = None
-        try:
-            # Keep the memory-safe one-face-at-a-time encoder for BOTH clear and
-            # covered faces.  A mask/niqab is a detection/recognition challenge,
-            # not a reason to discard the face before matching.  The final 50%
-            # confidence floor still protects attendance from weak matches.
-            enc = attendance_system._encode_face_one_at_a_time(rgb, loc)
-            if enc is not None:
-                encoding = [float(x) for x in enc]
-            del enc
-        except Exception as exc:
-            print(f"Face encoding failed for face {i} ({status}): {exc}")
+        if status != "masked":
+            try:
+                # IMPORTANT: never send the complete classroom image to dlib for
+                # every face. On Railway this can exhaust memory once a group has
+                # ~30+ faces. The engine helper crops/downscales one face at a
+                # time and uses num_jitters=0, keeping peak memory bounded.
+                enc = attendance_system._encode_face_one_at_a_time(rgb, loc)
+                if enc is not None:
+                    encoding = [float(x) for x in enc]
+                del enc
+            except Exception as exc:
+                print(f"Face encoding failed for face {i}: {exc}")
 
         # Small JPEG crops keep the review payload bounded for large group
         # photos. They remain large enough for the optional Add Student flow.
@@ -243,7 +244,7 @@ def check_faces_stage(
         # Release temporary OpenCV/dlib allocations during large classroom
         # batches instead of waiting until the whole request finishes.
         del crop
-        if i % 10 == 0:
+        if i % 3 == 0:
             gc.collect()
     job["faces"] = results
     job["stage"] = "faces_checked"
@@ -269,13 +270,13 @@ def check_enrollment_stage(
     # Match all clear faces globally, not one face at a time. This prevents the
     # same enrolled student from being assigned to multiple detected faces and
     # prevents a loose threshold from marking unrelated people present.
-    matchable_encodings = {
+    clear_encodings = {
         int(face["face_index"]): np.array(face["encoding"], dtype=np.float64)
         for face in job["faces"]
-        if face.get("encoding")
+        if face["face_status"] == "clear" and face.get("encoding")
     }
     assignments = attendance_system._assign_faces_to_students(
-        matchable_encodings,
+        clear_encodings,
         tolerance=float(tolerance),
         allowed_set=allowed_set,
         min_confidence=0.50,
@@ -290,22 +291,19 @@ def check_enrollment_stage(
         confidence = 0.0
         status = face["face_status"]
 
-        # Covered faces are still eligible for matching.  The engine now uses
-        # YuNet eye support to keep the detection box on the eyes/face and then
-        # attempts a memory-safe embedding.  Recognition is accepted only at
-        # the existing hard 50% confidence floor, so a weak masked-face match
-        # remains Unrecognized rather than being forced into an identity.
-        if face_index in assignments:
+        # Attendance-only rule: masked/covered faces remain detected exactly
+        # as before, but can never receive an identity or be counted Present.
+        if status in {"masked", "covered"}:
+            student_id = None
+            name = "Unrecognized"
+            confidence = 0.0
+            status = "unrecognized"
+        elif face_index in assignments:
             student_id, name, confidence = assignments[face_index]
-            if student_id is None or confidence < 0.50:
-                student_id = None
+            if student_id is None:
                 name = "Unrecognized"
-                confidence = 0.0
             elif student_id not in present_ids:
                 present_ids.append(student_id)
-        elif status == "masked":
-            name = "Unrecognized"
-            status = "masked"
 
         final_faces.append({
             "face_index": face_index, "student_id": student_id, "name": name,
