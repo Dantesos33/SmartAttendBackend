@@ -269,10 +269,12 @@ def check_enrollment_stage(
     # Match all clear faces globally, not one face at a time. This prevents the
     # same enrolled student from being assigned to multiple detected faces and
     # prevents a loose threshold from marking unrelated people present.
+    # Masked/covered faces are never eligible for identity matching.
+    # Recognition for clear faces is unchanged.
     matchable_encodings = {
         int(face["face_index"]): np.array(face["encoding"], dtype=np.float64)
         for face in job["faces"]
-        if face.get("encoding")
+        if face.get("encoding") and face.get("face_status") not in {"masked", "covered"}
     }
     assignments = attendance_system._assign_faces_to_students(
         matchable_encodings,
@@ -295,7 +297,11 @@ def check_enrollment_stage(
         # attempts a memory-safe embedding.  Recognition is accepted only at
         # the existing hard 50% confidence floor, so a weak masked-face match
         # remains Unrecognized rather than being forced into an identity.
-        if face_index in assignments:
+        if status in {"masked", "covered"}:
+            student_id = None
+            name = "Unrecognized"
+            confidence = 0.0
+        elif face_index in assignments:
             student_id, name, confidence = assignments[face_index]
             if student_id is None or confidence < 0.50:
                 student_id = None
