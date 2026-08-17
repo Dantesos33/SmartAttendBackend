@@ -310,6 +310,7 @@ def class_roster(
                 "students": [
                     {
                         "id": e.student.id,
+                        "student_id": e.student.student_id,
                         "name": e.student.name,
                         "email": e.student.email,
                         "avatar_url": e.student.avatar_url,
@@ -354,6 +355,7 @@ def section_roster(
         "students": [
             {
                 "id": e.student.id,
+                "student_id": e.student.student_id,
                 "name": e.student.name,
                 "email": e.student.email,
                 "avatar_url": e.student.avatar_url,
