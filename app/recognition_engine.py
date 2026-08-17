@@ -32,7 +32,6 @@ class ClassroomAttendanceSystem:
         self.metadata = self._load_json(self.metadata_path, {})
         self.sessions = self._load_json(self.sessions_path, [])
         self._yunet_detector = None
-        self._yunet_detector_size = None
         self._yunet_lock = threading.Lock()
         self._sr_model = None
         self._sr_lock = threading.Lock()
@@ -335,31 +334,28 @@ class ClassroomAttendanceSystem:
                     if last_exc is not None:
                         return None
         try:
-            requested_size = tuple(map(int, input_size))
-            with self._yunet_lock:
-                if self._yunet_detector is not None:
-                    return self._yunet_detector
-
-                previous_log_level = None
-                try:
-                    if hasattr(cv2, "getLogLevel") and hasattr(cv2, "setLogLevel"):
-                        previous_log_level = cv2.getLogLevel()
-                        cv2.setLogLevel(2)
-                    detector = cv2.FaceDetectorYN.create(
-                        YUNET_MODEL_PATH, "", requested_size,
-                        0.35, 0.30, 5000
-                    )
-                finally:
-                    if previous_log_level is not None:
-                        try:
-                            cv2.setLogLevel(previous_log_level)
-                        except Exception:
-                            pass
-
-                self._yunet_detector = detector
-                self._yunet_detector_size = requested_size
-                return detector
-        except Exception:
+            # Some OpenCV 4.x builds emit a warning from the internal graph engine
+            # while constructing FaceDetectorYN because it calls an unsupported
+            # preferable-target path internally. Suppress only that OpenCV warning
+            # during construction; detector parameters and behavior are unchanged.
+            previous_log_level = None
+            try:
+                if hasattr(cv2, "getLogLevel") and hasattr(cv2, "setLogLevel"):
+                    previous_log_level = cv2.getLogLevel()
+                    cv2.setLogLevel(2)  # ERROR: hide WARN, keep errors visible
+                detector = cv2.FaceDetectorYN.create(
+                    YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
+                    0.35, 0.30, 5000
+                )
+            finally:
+                if previous_log_level is not None:
+                    try:
+                        cv2.setLogLevel(previous_log_level)
+                    except Exception:
+                        pass
+            return detector
+        except Exception as exc:
+            print(f"YuNet initialization failed: {exc}")
             return None
 
     def _yunet_locations(self, bgr_image):
@@ -753,6 +749,8 @@ class ClassroomAttendanceSystem:
                 "size": max(fh, fw),
             })
             del crop
+            if idx % 5 == 0:
+                gc.collect()
 
         if not scored:
             return []
@@ -844,6 +842,7 @@ class ClassroomAttendanceSystem:
                 except Exception:
                     pass
                 del tile
+                gc.collect()
 
         for rotation, rotated in (
             ("cw", cv2.rotate(detect_img, cv2.ROTATE_90_CLOCKWISE)),
@@ -858,6 +857,7 @@ class ClassroomAttendanceSystem:
             except Exception:
                 pass
             del rotated
+            gc.collect()
 
         try:
             enlarged = cv2.resize(detect_img, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)
@@ -865,8 +865,9 @@ class ClassroomAttendanceSystem:
                 t,r,b,l = loc
                 raw.append(restore((int(t/1.35), int(r/1.35), int(b/1.35), int(l/1.35))))
             del enlarged
-        except Exception:
-            pass
+            gc.collect()
+        except Exception as exc:
+            print(f"Enlarged YuNet recovery failed: {exc}")
 
         final_locations = self._dedupe_face_locations(raw, original.shape)
         final_locations = self._filter_face_locations(original, final_locations)
@@ -1013,6 +1014,8 @@ class ClassroomAttendanceSystem:
         face_encodings_by_index = {}
         for idx, location in enumerate(face_locations):
             face_encodings_by_index[idx] = self._encode_face_one_at_a_time(classroom_image, location)
+            if idx and idx % 10 == 0:
+                gc.collect()
 
         assignments = {}
         if has_registered_faces:
