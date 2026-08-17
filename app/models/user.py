@@ -26,6 +26,12 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(Enum(UserRole), nullable=False, default=UserRole.student)
     avatar_url = Column(String(500), nullable=True)
+    # Expo push token for the device currently signed in as this user. A user
+    # is only ever signed in on one device at a time in this app, so a single
+    # column (rather than a device table) is enough; re-registering (new
+    # device, or the same device after a reinstall) simply overwrites it, and
+    # logging out / disabling the Push Notifications setting clears it.
+    push_token = Column(String(255), nullable=True)
     # 128-d face embedding persisted as JSON — survives Railway redeploys.
     face_encoding_json = Column(Text, nullable=True)
     # True for accounts a teacher created directly (bulk or single add) with a

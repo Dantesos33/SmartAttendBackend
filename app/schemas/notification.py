@@ -15,3 +15,8 @@ class NotificationOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class RegisterPushTokenRequest(BaseModel):
+    """Expo push token for the device the user is currently signed in on."""
+    push_token: str
