@@ -831,8 +831,14 @@ class ClassroomAttendanceSystem:
             # Neck/clothing/artifact candidates generally fail independent face
             # confirmation. This is separate from focus so a real but slightly
             # soft face is not removed just because YuNet prefers another box.
+            # Eyes-visible faces (including masks/niqabs) must remain detected.
+            # Detection is intentionally preserved here; the recognition stage
+            # separately forces masked/covered faces to Unrecognized.
             no_face_support = not item["confirmed"] and not item["eye_support"]
-            reject = no_face_support or ((very_soft or small_soft or background_soft) and not item["eye_support"]) or extremely_soft
+            weak_blur = ((very_soft or small_soft or background_soft) and not item["eye_support"])
+            reject = (no_face_support and not item["eye_support"]) or (weak_blur and not item["eye_support"]) or (
+                extremely_soft and not item["eye_support"]
+            )
 
             # If YuNet is unavailable, _yunet_candidate_support deliberately
             # returns confirmed=True, so the quality stage degrades safely to
