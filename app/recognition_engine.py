@@ -10,7 +10,7 @@ import urllib.request
 import threading
 
 MIN_CONFIDENCE = 0.50
-MAX_DETECT_EDGE = 1600  # Optimized down from 1800 for faster processing speed
+MAX_DETECT_EDGE = 1600
 MAX_ANNOTATED_EDGE = 1000
 MAX_FACE_CROP_EDGE = 512
 YUNET_MODEL_URL = "https://huggingface.co/pollen-robotics/face_detection_yunet_2023mar/resolve/main/face_detection_yunet_2023mar.onnx"
@@ -29,7 +29,7 @@ class ClassroomAttendanceSystem:
         self.sessions_path = "attendance_sessions.json"
 
         os.makedirs(self.known_students_dir, exist_ok=True)
-        os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True) # Ensure models directory exists globally on init
+        os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True)
         
         self.metadata = self._load_json(self.metadata_path, {})
         self.sessions = self._load_json(self.sessions_path, [])
@@ -186,7 +186,7 @@ class ClassroomAttendanceSystem:
         except Exception as e:
             return False, f"Error removing student {student_id}: {str(e)}"
 
-    def _encode_bgr_jpeg_base64(self, bgr_image, quality=75, max_edge=MAX_ANNOTATED_EDGE):
+    def _encode_bgr_jpeg_base64(self, bgr_image, quality=75, max_edge=MAX_ANNOTATED_EDGE, include_data_uri=True):
         try:
             h, w = bgr_image.shape[:2]
             if max(h, w) > max_edge:
@@ -199,7 +199,8 @@ class ClassroomAttendanceSystem:
             ok, buffer = cv2.imencode(".jpg", bgr_image, [cv2.IMWRITE_JPEG_QUALITY, quality])
             if not ok:
                 return None
-            return base64.b64encode(buffer).decode("utf-8")
+            encoded_str = base64.b64encode(buffer).decode("utf-8")
+            return f"data:image/jpeg;base64,{encoded_str}" if include_data_uri else encoded_str
         except Exception:
             return None
 
@@ -261,15 +262,11 @@ class ClassroomAttendanceSystem:
         except Exception:
             return crop_bgr
 
-    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=82, padded=False, max_edge=MAX_FACE_CROP_EDGE):
+    def _encode_rgb_crop_base64(self, rgb_image, top, right, bottom, left, quality=82, max_edge=MAX_FACE_CROP_EDGE):
         try:
             h, w = rgb_image.shape[:2]
             top, left = int(top), int(left)
             bottom, right = int(bottom), int(right)
-            if padded:
-                fh, fw = max(1, bottom - top), max(1, right - left)
-                top -= int(fh * 0.45); bottom += int(fh * 0.45)
-                left -= int(fw * 0.45); right += int(fw * 0.45)
             top = max(0, top); left = max(0, left)
             bottom = min(h, bottom); right = min(w, right)
             if bottom <= top or right <= left:
@@ -284,12 +281,11 @@ class ClassroomAttendanceSystem:
                 scale = float(max_edge) / longest
                 crop_bgr = cv2.resize(crop_bgr, (max(1, int(crop_bgr.shape[1] * scale)), max(1, int(crop_bgr.shape[0] * scale))), interpolation=cv2.INTER_AREA)
 
-            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality, max_edge=max_edge)
+            return self._encode_bgr_jpeg_base64(crop_bgr, quality=quality, max_edge=max_edge, include_data_uri=True)
         except Exception:
             return None
 
     def _get_yunet_detector(self, input_size):
-        # Return instantly if already loaded into memory
         if self._yunet_detector is not None:
             return self._yunet_detector
 
@@ -321,7 +317,6 @@ class ClassroomAttendanceSystem:
 
             try:
                 requested_size = tuple(map(int, input_size))
-                # Suppress OpenCV graph engine log warning
                 prev_level = cv2.getLogLevel() if hasattr(cv2, "getLogLevel") else None
                 if prev_level is not None:
                     cv2.setLogLevel(2)
@@ -356,20 +351,16 @@ class ClassroomAttendanceSystem:
                     score = vals[4] if len(vals) > 4 else 1.0
                 else:
                     x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
-                    right_eye_x, right_eye_y = vals[4], vals[5]
-                    left_eye_x, left_eye_y = vals[6], vals[7]
                     score = vals[14]
 
                 if score < 0.35 or bw < 10 or bh < 10:
                     continue
 
+                # YuNet returns [x, y, w, h]. Convert properly to [top, right, bottom, left]
                 results.append((int(y), int(x + bw), int(y + bh), int(x)))
             return results
         except Exception:
             return []
-
-    def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
-        return "clear"
 
     def _downscale_rgb(self, rgb_image, max_edge):
         h, w = rgb_image.shape[:2]
@@ -459,23 +450,25 @@ class ClassroomAttendanceSystem:
         return kept
 
     def _detect_face_locations(self, rgb_image):
-        """Optimized high-speed detection bypassing redundant passes."""
         original = np.ascontiguousarray(rgb_image)
         h, w = original.shape[:2]
         detect_img, scale = self._downscale_rgb(original, MAX_DETECT_EDGE)
-        inv_scale = 1.0 / scale
+        
+        # Correctly map scale back to original dimensions
+        inv_scale_w = w / float(detect_img.shape[1])
+        inv_scale_h = h / float(detect_img.shape[0])
         raw = []
 
         def restore(loc):
             t, r, b, l = loc
             return (
-                max(0, int(round(t * inv_scale))),
-                min(w, int(round(r * inv_scale))),
-                min(h, int(round(b * inv_scale))),
-                max(0, int(round(l * inv_scale))),
+                max(0, int(round(t * inv_scale_h))),
+                min(w, int(round(r * inv_scale_w))),
+                min(h, int(round(b * inv_scale_h))),
+                max(0, int(round(l * inv_scale_w))),
             )
 
-        # 1) Fast YuNet primary pass (handles 90% of faces instantly)
+        # 1) Fast YuNet primary pass
         try:
             yunet_input = cv2.cvtColor(detect_img, cv2.COLOR_RGB2BGR)
             for loc in self._yunet_locations(yunet_input):
@@ -483,7 +476,7 @@ class ClassroomAttendanceSystem:
         except Exception as exc:
             print(f"YuNet detection failed: {exc}")
 
-        # 2) Fallback/Complementary HOG pass only if YuNet misses items
+        # 2) Fallback/Complementary HOG pass
         try:
             for loc in face_recognition.face_locations(detect_img, number_of_times_to_upsample=1, model="hog"):
                 raw.append(restore(loc))
@@ -634,6 +627,15 @@ class ClassroomAttendanceSystem:
                 elif student_id not in present_student_ids:
                     present_student_ids.append(student_id)
 
+            # Ensure student avatar data uri or path can be safely linked on review screens
+            student_avatar_base64 = None
+            if student_id is not None:
+                avatar_path = os.path.join(self.known_students_dir, f"{student_id}.jpg")
+                if os.path.exists(avatar_path):
+                    av_img = cv2.imread(avatar_path)
+                    if av_img is not None:
+                        student_avatar_base64 = self._encode_bgr_jpeg_base64(av_img, quality=75, max_edge=256, include_data_uri=True)
+
             face_details.append({
                 "face_index": face_index,
                 "student_id": student_id,
@@ -641,6 +643,7 @@ class ClassroomAttendanceSystem:
                 "confidence": float(confidence),
                 "location": {"top": top, "right": right, "bottom": bottom, "left": left},
                 "crop_base64": self._encode_rgb_crop_base64(classroom_image, top, right, bottom, left),
+                "student_avatar_base64": student_avatar_base64,
             })
 
             color = (0, 255, 0) if student_id is not None else (0, 0, 255)
@@ -674,7 +677,7 @@ class ClassroomAttendanceSystem:
         annotated_path = f"output/annotated_classroom_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
         cv2.imwrite(annotated_path, annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, 82])
         attendance_data["annotated_image_path"] = annotated_path
-        attendance_data["annotated_image_base64"] = self._encode_bgr_jpeg_base64(annotated_bgr, quality=68, max_edge=MAX_ANNOTATED_EDGE)
+        attendance_data["annotated_image_base64"] = self._encode_bgr_jpeg_base64(annotated_bgr, quality=68, max_edge=MAX_ANNOTATED_EDGE, include_data_uri=True)
 
         del classroom_image, annotated_bgr
         gc.collect()
