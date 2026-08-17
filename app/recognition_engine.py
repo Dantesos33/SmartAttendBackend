@@ -389,10 +389,25 @@ class ClassroomAttendanceSystem:
                         )
                         return None
         try:
-            detector = cv2.FaceDetectorYN.create(
-                YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
-                0.35, 0.30, 5000
-            )
+            # Some OpenCV 4.x builds emit a warning from the internal graph engine
+            # while constructing FaceDetectorYN because it calls an unsupported
+            # preferable-target path internally. Suppress only that OpenCV warning
+            # during construction; detector parameters and behavior are unchanged.
+            previous_log_level = None
+            try:
+                if hasattr(cv2, "getLogLevel") and hasattr(cv2, "setLogLevel"):
+                    previous_log_level = cv2.getLogLevel()
+                    cv2.setLogLevel(2)  # ERROR: hide WARN, keep errors visible
+                detector = cv2.FaceDetectorYN.create(
+                    YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
+                    0.35, 0.30, 5000
+                )
+            finally:
+                if previous_log_level is not None:
+                    try:
+                        cv2.setLogLevel(previous_log_level)
+                    except Exception:
+                        pass
             return detector
         except Exception as exc:
             print(f"YuNet initialization failed: {exc}")
@@ -1236,7 +1251,7 @@ class ClassroomAttendanceSystem:
         face_encodings_by_index = {}
         for idx, location in enumerate(face_locations):
             face_encodings_by_index[idx] = self._encode_face_one_at_a_time(classroom_image, location)
-            if idx and idx % 5 == 0:
+            if idx and idx % 10 == 0:
                 gc.collect()
 
         assignments = {}
