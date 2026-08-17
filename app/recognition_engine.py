@@ -376,6 +376,52 @@ class ClassroomAttendanceSystem:
             for row in detections:
                 vals = [float(v) for v in row]
                 if len(vals) < 15:
+                    # Fallback for malformed rows
+                    x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
+                    score = vals[4] if len(vals) > 4 else 1.0
+                else:
+                    # Correct layout: indices 4-13 are landmarks, index 14 is the confidence score
+                    x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
+                    right_eye_x, right_eye_y = vals[4], vals[5]
+                    left_eye_x, left_eye_y = vals[6], vals[7]
+                    score = vals[14]
+
+                if score < 0.35 or bw < 10 or bh < 10:
+                    continue
+
+                if len(vals) >= 15:
+                    # Re-anchor box if it floats too high relative to the eye line
+                    interocular = abs(left_eye_x - right_eye_x)
+                    if interocular > 2 and bh > 0:
+                        eye_cx = (right_eye_x + left_eye_x) / 2.0
+                        eye_cy = (right_eye_y + left_eye_y) / 2.0
+                        eye_frac_y = (eye_cy - y) / bh
+                        
+                        if eye_frac_y < 0.30 or eye_frac_y > 0.60:
+                            face_w = max(bw, interocular * 2.2)
+                            face_h = face_w * 1.15
+                            x = eye_cx - face_w / 2.0
+                            y = eye_cy - face_h * 0.40
+                            bw, bh = face_w, face_h
+
+                results.append((int(y), int(x + bw), int(y + bh), int(x)))
+            return results
+        except Exception as exc:
+            print(f"YuNet detection failed: {exc}")
+            return []
+        h, w = bgr_image.shape[:2]
+        detector = self._get_yunet_detector((w, h))
+        if detector is None:
+            return []
+        try:
+            detector.setInputSize((w, h))
+            _, detections = detector.detect(bgr_image)
+            if detections is None:
+                return []
+            results = []
+            for row in detections:
+                vals = [float(v) for v in row]
+                if len(vals) < 15:
                     x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
                 else:
                     x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
