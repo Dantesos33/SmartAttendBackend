@@ -356,7 +356,6 @@ class ClassroomAttendanceSystem:
                 if score < 0.35 or bw < 10 or bh < 10:
                     continue
 
-                # YuNet returns [x, y, w, h]. Convert properly to [top, right, bottom, left]
                 results.append((int(y), int(x + bw), int(y + bh), int(x)))
             return results
         except Exception:
@@ -454,7 +453,6 @@ class ClassroomAttendanceSystem:
         h, w = original.shape[:2]
         detect_img, scale = self._downscale_rgb(original, MAX_DETECT_EDGE)
         
-        # Correctly map scale back to original dimensions
         inv_scale_w = w / float(detect_img.shape[1])
         inv_scale_h = h / float(detect_img.shape[0])
         raw = []
@@ -468,7 +466,6 @@ class ClassroomAttendanceSystem:
                 max(0, int(round(l * inv_scale_w))),
             )
 
-        # 1) Fast YuNet primary pass
         try:
             yunet_input = cv2.cvtColor(detect_img, cv2.COLOR_RGB2BGR)
             for loc in self._yunet_locations(yunet_input):
@@ -476,7 +473,6 @@ class ClassroomAttendanceSystem:
         except Exception as exc:
             print(f"YuNet detection failed: {exc}")
 
-        # 2) Fallback/Complementary HOG pass
         try:
             for loc in face_recognition.face_locations(detect_img, number_of_times_to_upsample=1, model="hog"):
                 raw.append(restore(loc))
@@ -627,7 +623,6 @@ class ClassroomAttendanceSystem:
                 elif student_id not in present_student_ids:
                     present_student_ids.append(student_id)
 
-            # Ensure student avatar data uri or path can be safely linked on review screens
             student_avatar_base64 = None
             if student_id is not None:
                 avatar_path = os.path.join(self.known_students_dir, f"{student_id}.jpg")
