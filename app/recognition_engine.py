@@ -32,6 +32,7 @@ class ClassroomAttendanceSystem:
         self.metadata = self._load_json(self.metadata_path, {})
         self.sessions = self._load_json(self.sessions_path, [])
         self._yunet_detector = None
+        self._yunet_detector_size = None
         self._yunet_lock = threading.Lock()
         self._sr_model = None
         self._sr_lock = threading.Lock()
@@ -389,26 +390,38 @@ class ClassroomAttendanceSystem:
                         )
                         return None
         try:
-            # Some OpenCV 4.x builds emit a warning from the internal graph engine
-            # while constructing FaceDetectorYN because it calls an unsupported
-            # preferable-target path internally. Suppress only that OpenCV warning
-            # during construction; detector parameters and behavior are unchanged.
-            previous_log_level = None
-            try:
-                if hasattr(cv2, "getLogLevel") and hasattr(cv2, "setLogLevel"):
-                    previous_log_level = cv2.getLogLevel()
-                    cv2.setLogLevel(2)  # ERROR: hide WARN, keep errors visible
-                detector = cv2.FaceDetectorYN.create(
-                    YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
-                    0.35, 0.30, 5000
-                )
-            finally:
-                if previous_log_level is not None:
-                    try:
-                        cv2.setLogLevel(previous_log_level)
-                    except Exception:
-                        pass
-            return detector
+            requested_size = tuple(map(int, input_size))
+            # Reuse the same loaded YuNet object. Creating a FaceDetectorYN instance
+            # for every face/candidate is surprisingly expensive and was one of the
+            # largest avoidable CPU costs in the recognition pipeline. setInputSize
+            # is enough when the image dimensions change.
+            with self._yunet_lock:
+                if self._yunet_detector is not None:
+                    return self._yunet_detector
+
+                # Some OpenCV 4.x builds emit a warning from the internal graph engine
+                # while constructing FaceDetectorYN because it calls an unsupported
+                # preferable-target path internally. Suppress only that OpenCV warning
+                # during construction; detector parameters and behavior are unchanged.
+                previous_log_level = None
+                try:
+                    if hasattr(cv2, "getLogLevel") and hasattr(cv2, "setLogLevel"):
+                        previous_log_level = cv2.getLogLevel()
+                        cv2.setLogLevel(2)  # ERROR: hide WARN, keep errors visible
+                    detector = cv2.FaceDetectorYN.create(
+                        YUNET_MODEL_PATH, "", requested_size,
+                        0.35, 0.30, 5000
+                    )
+                finally:
+                    if previous_log_level is not None:
+                        try:
+                            cv2.setLogLevel(previous_log_level)
+                        except Exception:
+                            pass
+
+                self._yunet_detector = detector
+                self._yunet_detector_size = requested_size
+                return detector
         except Exception as exc:
             print(f"YuNet initialization failed: {exc}")
             return None
@@ -859,8 +872,6 @@ class ClassroomAttendanceSystem:
                 "size": max(fh, fw),
             })
             del crop
-            if idx % 5 == 0:
-                gc.collect()
 
         if not scored:
             return []
@@ -1013,7 +1024,6 @@ class ClassroomAttendanceSystem:
                 except Exception as exc:
                     print(f"HOG tile detection failed at ({x0},{y0}): {exc}")
                 del tile
-                gc.collect()
 
         # 4) Orientation recovery.
         pass4_count = 0
@@ -1031,7 +1041,6 @@ class ClassroomAttendanceSystem:
             except Exception as exc:
                 print(f"Rotated HOG ({rotation}) failed: {exc}")
             del rotated
-            gc.collect()
 
         # 5) A second YuNet pass on a 1.35x image catches distant/partially
         # occluded faces that are below the effective size of the first pass.
@@ -1043,7 +1052,6 @@ class ClassroomAttendanceSystem:
                 raw.append(restore((int(t/1.35), int(r/1.35), int(b/1.35), int(l/1.35))))
                 pass5_count += 1
             del enlarged
-            gc.collect()
         except Exception as exc:
             print(f"Enlarged YuNet recovery failed: {exc}")
 
@@ -1251,8 +1259,6 @@ class ClassroomAttendanceSystem:
         face_encodings_by_index = {}
         for idx, location in enumerate(face_locations):
             face_encodings_by_index[idx] = self._encode_face_one_at_a_time(classroom_image, location)
-            if idx and idx % 10 == 0:
-                gc.collect()
 
         assignments = {}
         if has_registered_faces:
