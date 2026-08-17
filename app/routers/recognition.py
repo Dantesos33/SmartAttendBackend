@@ -273,7 +273,7 @@ def check_enrollment_stage(
     clear_encodings = {
         int(face["face_index"]): np.array(face["encoding"], dtype=np.float64)
         for face in job["faces"]
-        if face["face_status"] == "clear" and face.get("encoding")
+        if face.get("face_status") == "clear" and face.get("encoding")
     }
     assignments = attendance_system._assign_faces_to_students(
         clear_encodings,
@@ -294,10 +294,12 @@ def check_enrollment_stage(
         # Attendance-only rule: masked/covered faces remain detected exactly
         # as before, but can never receive an identity or be counted Present.
         if status in {"masked", "covered"}:
+            # HARD RULE: a masked/covered face can never be recognized.
+            # Keep its original face_status so detection/box/crop/UI remain
+            # unchanged; only identity/attendance is forced to Unrecognized.
             student_id = None
             name = "Unrecognized"
             confidence = 0.0
-            status = "unrecognized"
         elif face_index in assignments:
             student_id, name, confidence = assignments[face_index]
             if student_id is None:
