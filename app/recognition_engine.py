@@ -309,6 +309,19 @@ class ClassroomAttendanceSystem:
             return None
 
     def _get_yunet_detector(self, input_size):
+        # PERFORMANCE: this used to call cv2.FaceDetectorYN.create(...) on
+        # every single invocation — that reloads/reparses the ONNX model from
+        # scratch. _filter_face_locations calls this once per candidate face
+        # (via _yunet_candidate_support), so a 30-40 face classroom photo was
+        # rebuilding the neural net 30-40+ times per request. The detector is
+        # cheap to reconfigure for a new frame size via setInputSize(), so we
+        # build it once and cache the instance instead. Model weights, score
+        # threshold (0.35), NMS threshold (0.30) and top_k (5000) are
+        # unchanged, so detection output/accuracy is identical — only the
+        # redundant reconstruction is removed.
+        if self._yunet_detector is not None:
+            return self._yunet_detector
+
         if not hasattr(cv2, "FaceDetectorYN"):
             return None
         os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True)
@@ -333,30 +346,34 @@ class ClassroomAttendanceSystem:
                                 pass
                     if last_exc is not None:
                         return None
-        try:
-            # Some OpenCV 4.x builds emit a warning from the internal graph engine
-            # while constructing FaceDetectorYN because it calls an unsupported
-            # preferable-target path internally. Suppress only that OpenCV warning
-            # during construction; detector parameters and behavior are unchanged.
-            previous_log_level = None
+        with self._yunet_lock:
+            if self._yunet_detector is not None:
+                return self._yunet_detector
             try:
-                if hasattr(cv2, "getLogLevel") and hasattr(cv2, "setLogLevel"):
-                    previous_log_level = cv2.getLogLevel()
-                    cv2.setLogLevel(2)  # ERROR: hide WARN, keep errors visible
-                detector = cv2.FaceDetectorYN.create(
-                    YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
-                    0.35, 0.30, 5000
-                )
-            finally:
-                if previous_log_level is not None:
-                    try:
-                        cv2.setLogLevel(previous_log_level)
-                    except Exception:
-                        pass
-            return detector
-        except Exception as exc:
-            print(f"YuNet initialization failed: {exc}")
-            return None
+                # Some OpenCV 4.x builds emit a warning from the internal graph engine
+                # while constructing FaceDetectorYN because it calls an unsupported
+                # preferable-target path internally. Suppress only that OpenCV warning
+                # during construction; detector parameters and behavior are unchanged.
+                previous_log_level = None
+                try:
+                    if hasattr(cv2, "getLogLevel") and hasattr(cv2, "setLogLevel"):
+                        previous_log_level = cv2.getLogLevel()
+                        cv2.setLogLevel(2)  # ERROR: hide WARN, keep errors visible
+                    detector = cv2.FaceDetectorYN.create(
+                        YUNET_MODEL_PATH, "", tuple(map(int, input_size)),
+                        0.35, 0.30, 5000
+                    )
+                finally:
+                    if previous_log_level is not None:
+                        try:
+                            cv2.setLogLevel(previous_log_level)
+                        except Exception:
+                            pass
+                self._yunet_detector = detector
+            except Exception as exc:
+                print(f"YuNet initialization failed: {exc}")
+                return None
+        return self._yunet_detector
 
     def _yunet_locations(self, bgr_image):
         h, w = bgr_image.shape[:2]
@@ -404,46 +421,6 @@ class ClassroomAttendanceSystem:
             return results
         except Exception as exc:
             print(f"YuNet detection failed: {exc}")
-            return []
-        h, w = bgr_image.shape[:2]
-        detector = self._get_yunet_detector((w, h))
-        if detector is None:
-            return []
-        try:
-            detector.setInputSize((w, h))
-            _, detections = detector.detect(bgr_image)
-            if detections is None:
-                return []
-            results = []
-            for row in detections:
-                vals = [float(v) for v in row]
-                if len(vals) < 15:
-                    x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
-                else:
-                    x, y, bw, bh = vals[0], vals[1], vals[2], vals[3]
-                    right_eye_x, right_eye_y = vals[4], vals[5]
-                    left_eye_x, left_eye_y = vals[6], vals[7]
-                    score = vals[14]
-
-                if score < 0.35 or bw < 10 or bh < 10:
-                    continue
-
-                if len(vals) >= 15:
-                    interocular = abs(left_eye_x - right_eye_x)
-                    if interocular > 2 and bh > 0:
-                        eye_cx = (right_eye_x + left_eye_x) / 2.0
-                        eye_cy = (right_eye_y + left_eye_y) / 2.0
-                        eye_frac_y = (eye_cy - y) / bh
-                        if eye_frac_y < 0.30 or eye_frac_y > 0.60:
-                            face_w = max(bw, interocular * 2.2)
-                            face_h = face_w * 1.15
-                            x = eye_cx - face_w / 2.0
-                            y = eye_cy - face_h * 0.40
-                            bw, bh = face_w, face_h
-
-                results.append((int(y), int(x + bw), int(y + bh), int(x)))
-            return results
-        except Exception:
             return []
 
     def classify_face_occlusion(self, rgb_image, location, encoding_available=False):
@@ -749,7 +726,14 @@ class ClassroomAttendanceSystem:
                 "size": max(fh, fw),
             })
             del crop
-            if idx % 5 == 0:
+            # PERFORMANCE: gc.collect() is a full sweep of every tracked
+            # object; calling it every few faces was mostly compensating for
+            # the YuNet detector being rebuilt on every candidate (now fixed
+            # in _get_yunet_detector). Small per-face crops are freed by
+            # normal refcounting as soon as `del crop` runs, so we only need
+            # an occasional sweep to reclaim any cyclic garbage, not one
+            # every 5 faces.
+            if idx and idx % 25 == 0:
                 gc.collect()
 
         if not scored:
@@ -828,20 +812,29 @@ class ClassroomAttendanceSystem:
         step_y = max(1, int(tile_h * 0.58))
         xs = sorted(set([0, max(0, tw - tile_w)] + list(range(0, max(1, tw - tile_w + 1), step_x))))
         ys = sorted(set([0, max(0, th - tile_h)] + list(range(0, max(1, th - tile_h + 1), step_y))))
-        for y0 in ys:
-            for x0 in xs:
-                tile = detect_img[y0:min(th, y0+tile_h), x0:min(tw, x0+tile_w)]
-                if tile.shape[0] < 300 or tile.shape[1] < 300:
-                    continue
-                try:
-                    for loc in face_recognition.face_locations(
-                        tile, number_of_times_to_upsample=2, model="hog"
-                    ):
-                        t, r, b, l = loc
-                        raw.append(restore((t+y0, r+x0, b+y0, l+x0)))
-                except Exception:
-                    pass
-                del tile
+        # PERFORMANCE: each tile here is a numpy *view* into detect_img (a
+        # slice, not a copy), so `del tile` releases nothing by itself, and
+        # dlib's own internal upsample buffer is already freed in C++ before
+        # control returns to Python. A full gc.collect() sweep after every
+        # single tile (previously unconditional) added real CPU overhead
+        # without reclaiming extra memory. Sweeping every few tiles is
+        # enough to bound peak memory for classroom photos with many tiles.
+        for tile_idx, (y0, x0) in enumerate(
+            (y0, x0) for y0 in ys for x0 in xs
+        ):
+            tile = detect_img[y0:min(th, y0+tile_h), x0:min(tw, x0+tile_w)]
+            if tile.shape[0] < 300 or tile.shape[1] < 300:
+                continue
+            try:
+                for loc in face_recognition.face_locations(
+                    tile, number_of_times_to_upsample=2, model="hog"
+                ):
+                    t, r, b, l = loc
+                    raw.append(restore((t+y0, r+x0, b+y0, l+x0)))
+            except Exception:
+                pass
+            del tile
+            if tile_idx and tile_idx % 4 == 0:
                 gc.collect()
 
         for rotation, rotated in (
@@ -857,7 +850,7 @@ class ClassroomAttendanceSystem:
             except Exception:
                 pass
             del rotated
-            gc.collect()
+        gc.collect()
 
         try:
             enlarged = cv2.resize(detect_img, None, fx=1.35, fy=1.35, interpolation=cv2.INTER_CUBIC)

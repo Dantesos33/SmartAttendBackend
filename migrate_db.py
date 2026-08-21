@@ -29,13 +29,19 @@ def run_migrations():
     inspector = inspect(engine)
     if inspector.has_table("users") and not inspector.has_table("alembic_version"):
         # Adopt databases created by the former create_all-based bootstrap.
-        # They already contain the baseline schema, so stamping avoids trying
-        # to recreate existing tables; all future revisions still run normally.
-        command.stamp(alembic_config, "head")
-        print("✓ Existing schema adopted as Alembic baseline.")
-    else:
-        command.upgrade(alembic_config, "head")
-        print("✓ Alembic migrations applied.")
+        # They already contain the BASELINE schema (0001_initial_schema), so
+        # stamp at that revision — NOT "head" — then let the normal upgrade
+        # below carry the DB through every revision after it (e.g.
+        # 0002_user_face_encoding, 0003_user_push_token). Stamping straight
+        # to "head" was a bug: it marks the DB as fully migrated without
+        # ever running the ALTER TABLEs for later revisions, so columns like
+        # face_encoding_json / push_token silently never get created on any
+        # database that predates Alembic, and every write to them fails.
+        command.stamp(alembic_config, "0001_initial_schema")
+        print("✓ Existing schema adopted at Alembic baseline (0001_initial_schema).")
+
+    command.upgrade(alembic_config, "head")
+    print("✓ Alembic migrations applied.")
 
     # 2. Check and seed initial admin user if no admin exists
     db = SessionLocal()

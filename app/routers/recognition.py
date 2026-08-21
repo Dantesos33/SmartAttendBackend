@@ -244,7 +244,12 @@ def check_faces_stage(
         # Release temporary OpenCV/dlib allocations during large classroom
         # batches instead of waiting until the whole request finishes.
         del crop
-        if i % 3 == 0:
+        # PERFORMANCE: this was sweeping on every 3rd face — with the YuNet
+        # detector now cached (see recognition_engine._get_yunet_detector)
+        # per-face work here is much cheaper, so a full gc.collect() that
+        # often is unnecessary overhead for large group photos. Sweeping
+        # every 10 faces still keeps peak memory bounded for Railway.
+        if i and i % 10 == 0:
             gc.collect()
     job["faces"] = results
     job["stage"] = "faces_checked"
